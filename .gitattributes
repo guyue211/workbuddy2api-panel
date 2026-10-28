@@ -6,3 +6,7 @@
 # （TestAppJSEventsView / TestAppJSStoreRemarksReportsFailure）。
 # 属性一旦写死，检出与规范化就与各人的 autocrlf 设置无关。
 *.js   text eol=lf
+
+# 本文件自身也钉成 LF：否则 core.autocrlf=true 的机器下次检出会把它写成 CRLF，
+# 提交时反复刷出 "LF will be replaced by CRLF" 警告（规则本身不受影响，只是噪音）。
+.gitattributes text eol=lf
