@@ -1950,6 +1950,12 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	out := make([]ModelInfo, 0, len(cliIDs))
 	for _, id := range cliIDs {
+		// auto / auto-chat 是客户端「自动模式」开关，不是菜单项（见 clientpick.go
+		// 的 autoModeIDs）。企业端点的 agents[cli].models 里带着它们，不过滤就会让
+		// /v1/models 多出一条客户端根本不显示的 auto——CN 实测 17 项菜单变 18 条。
+		if isAutoModeID(id) {
+			continue
+		}
 		if m, ok := dynMap[id]; ok && !m.Disabled {
 			out = append(out, m.modelInfo())
 		}
@@ -1961,22 +1967,41 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 }
 
 // fetchV3Models 单路探测 /v3/config（IDE UA 完整能力版，见 codeBuddyIDEUA）。
-// v3 面取全量 models（不按 agents[cli] 过滤，与 global 探测口径一致），按同一
-// nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
-// 失败返回错误（调用方降级为仅企业端点）。
+//
+// 可见性口径（2026-10-29 起）：菜单项 = 客户端 picker 口径（clientpick.go 的
+// agents[默认].models − paidId + 三个速度预设），按菜单顺序输出。此前这里是
+// 「v3 全量 models 只剔 nonChatModel」，CN 实测会把 58 条平台目录里客户端根本不显示
+// 的 30 余条（hy3-b/c/x、default-1.1/1.2、codewise-*、hunyuan-3b…）列给下游，
+// 表现为「模型列表和官方客户端对不上」。上游没下发 agents 时 pick 为 nil，
+// 回落全量（老版本/私有化不该被裁剪）。
+//
+// 无论哪条分支都照旧过 nonChatModel：补全模型、短输出模型、出图出视频模型即使
+// 出现在 agent 名单里也不能进对话列表（选了上游回 11102）。
 func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
-	byID, err := c.fetchV3ConfigModelMap(a, c.v3ProbeUA(a))
+	byID, pick, err := c.fetchV3ConfigModelMap(a, c.v3ProbeUA(a))
 	if err != nil {
 		return nil, err
 	}
 	// 出图模型旁路留存（供 /v1/models 以 image_generation 标记列出），下面照旧不进对话列表。
+	// 必须在可见性过滤**前**做：媒体模型不在 agent 菜单里，过滤后就拿不到了。
 	c.stashGenerationModels("cn", sortedInfos(byID))
 	out := make([]ModelInfo, 0, len(byID))
-	for _, mi := range byID {
-		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
-			continue
+	if ids := pick.ordered(byID); ids != nil {
+		for _, id := range ids {
+			mi := byID[id]
+			if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
+				continue
+			}
+			out = append(out, mi)
 		}
-		out = append(out, mi)
+	} else {
+		// 口径缺失（上游无 agents）：照旧全量，只剔非对话条目。
+		for _, mi := range byID {
+			if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
+				continue
+			}
+			out = append(out, mi)
+		}
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("v3/config returned empty models")
@@ -2328,10 +2353,15 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 // 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
 // ua 为该次请求的 User-Agent；空串等价 codeBuddyIDEUA。该端点对 UA 敏感且**不同 UA 下发
 // 不同模型集合**（见 codeBuddyCLIUA 注释），global 探测据此并发两路取并集。
-func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
+//
+// 第二个返回值是**同一次响应**里的客户端可见性口径（data.agents + ModelRateLimitCap，
+// 见 clientpick.go）：能力表是全量目录，可见性才是「官方客户端菜单会显示什么」。
+// 两者必须同源——分两次请求取会撞上目录滚动更新，白名单与能力表对不上。
+// 上游没下发 agents（企业端点/私有化/老版本）时 pick 为 nil，调用方照旧全量列出。
+func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, *clientPick, error) {
 	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v3/config", nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -2351,16 +2381,16 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	req.Header.Set("User-Agent", ua)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		// 读失败 → 传输层错误：半截 body 不进解析（不罚号）。
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, nil, fmt.Errorf("read body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("v3/config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return nil, nil, fmt.Errorf("v3/config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
 	var env struct {
 		Code int `json:"code"`
@@ -2376,7 +2406,15 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 						TargetModelID string `json:"targetModelId"`
 					} `json:"banners"`
 				} `json:"ModelTrialBanner"`
+				// ModelRateLimitCap 免费额度撞顶后的付费变体表（freeId → paidId）：
+				// 客户端把 paidId 并进 freeId 那一行，不单独列菜单项（见 clientpick.go）。
+				ModelRateLimitCap struct {
+					Lines []v3RateLimitLine `json:"lines"`
+				} `json:"ModelRateLimitCap"`
 			} `json:"productFeaturesConfig"`
+			// Agents 客户端菜单的数据源：默认 agent 的 models 即「官方客户端会显示的
+			// 模型」。data.models 是平台全量目录，比它多得多（见 clientpick.go 实测数）。
+			Agents          []v3ConfigAgent    `json:"agents"`
 			ModelPromotions []v3ModelPromotion `json:"modelPromotions"`
 			// ModelTiers 付费层级表（issue #235）：海外「Pro Only」= 专业版专属
 			// （免费号选了就报错），国内「订阅优先」= 仅排队优先。清单与文案都在这，
@@ -2385,11 +2423,12 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("v3/config parse: %w", err)
+		return nil, nil, fmt.Errorf("v3/config parse: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, fmt.Errorf("v3/config code=%d", env.Code)
+		return nil, nil, fmt.Errorf("v3/config code=%d", env.Code)
 	}
+	pick := newClientPick(env.Data.Agents, env.Data.ProductFeaturesConfig.ModelRateLimitCap.Lines)
 	out := make(map[string]ModelInfo, len(env.Data.Models))
 	for _, m := range env.Data.Models {
 		if strings.TrimSpace(m.ID) == "" {
@@ -2449,9 +2488,9 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	applyModelTiers(out, env.Data.ModelTiers)
 
 	if len(out) == 0 {
-		return nil, fmt.Errorf("v3/config returned empty models")
+		return nil, nil, fmt.Errorf("v3/config returned empty models")
 	}
-	return out, nil
+	return out, pick, nil
 }
 
 // UserResource 查询账号积分余额与总额度（所有套餐聚合）。remain 负值钳 0；
