@@ -910,6 +910,10 @@ type Client struct {
 	// creditObserver 余额查询观察者（见 CreditObserver / SetCreditObserver）。
 	// atomic：启动期挂载、运行期并发读，不参与任何出站决策。
 	creditObserver atomic.Pointer[CreditObserver]
+
+	// modelBusyUnsupported 上游 /v2/chat/busy 在该域不存在（国际版实测 404）。探到一次即置位，
+	// 本进程后续跳过探测（见 modelbusy.go）。atomic：并发调用只读+一次性写。
+	modelBusyUnsupported atomic.Bool
 }
 
 // CreditObserver 余额查询观察者：每次**真实查到**余额后回调（uid + 余额绝对值）。
@@ -1620,6 +1624,14 @@ type ModelInfo struct {
 	Efforts       []string // reasoning.supportedEfforts（空=未知/固定档）
 	DefaultEffort string   // reasoning.defaultEffort（新模型键）或 reasoning.effort（老模型键）；空=未返回
 
+	// ContextWindowDefault / ContextWindowSupported 上游 contextWindow 段（5.9.3 新增，
+	// 实测 CN 17 个 / global 3 个模型带）：defaultLength 是默认档，supportedLengths 是
+	// 用户可在客户端切换的上下文档位（如 gpt-6-astra [400000,1000000]、hy4-preview
+	// [300000,600000,960000]）。与 maxInputTokens 不是同一口径——maxInputTokens 是
+	// 当前生效上限，supportedLengths 是**可选项**，丢掉它客户端就没法发现 1M 档。
+	ContextWindowDefault   int64
+	ContextWindowSupported []int64
+
 	// 模型目录全字段（models-full-fields）：
 	Description string   // descriptionZh 中文描述
 	Credits     string   // credits 积分倍率原文（如 "x0.05"），仅展示不参与选号
@@ -1681,7 +1693,13 @@ type dynModelEntry struct {
 	SupportsReason  bool     `json:"supportsReasoning"`
 	SupportsTool    bool     `json:"supportsToolCall"`
 	OnlyReasoning   bool     `json:"onlyReasoning"`
-	Reasoning       struct {
+	// ContextWindow contextWindow 段（5.9.3 新增）：defaultLength + supportedLengths。
+	// 指针形态区分「上游没给」与「给了空数组」——前者不输出，后者同样不该编造档位。
+	ContextWindow *struct {
+		DefaultLength    int64   `json:"defaultLength"`
+		SupportedLengths []int64 `json:"supportedLengths"`
+	} `json:"contextWindow"`
+	Reasoning struct {
 		Effort             string   `json:"effort"`
 		Summary            string   `json:"summary"`
 		DefaultEffort      string   `json:"defaultEffort"`
@@ -1696,6 +1714,20 @@ func (m dynModelEntry) modelInfo() ModelInfo {
 	def := m.Reasoning.DefaultEffort
 	if def == "" {
 		def = m.Reasoning.Effort
+	}
+	// contextWindow 两档都只在至少有一个正值时才暴露：全 0/空数组等于「上游没声明档位」，
+	// 这种条目输出 {"default":0,"supported":[]} 只会让下游把它当成"只有 0 token"。
+	var cwDefault int64
+	var cwSupported []int64
+	if m.ContextWindow != nil {
+		if m.ContextWindow.DefaultLength > 0 {
+			cwDefault = m.ContextWindow.DefaultLength
+		}
+		for _, n := range m.ContextWindow.SupportedLengths {
+			if n > 0 {
+				cwSupported = append(cwSupported, n)
+			}
+		}
 	}
 	return ModelInfo{
 		ID:                 m.ID,
@@ -1718,6 +1750,9 @@ func (m dynModelEntry) modelInfo() ModelInfo {
 		CanDisableThinking: m.Reasoning.CanDisableThinking,
 		ReasoningEffort:    m.Reasoning.Effort,
 		ReasoningSummary:   m.Reasoning.Summary,
+
+		ContextWindowDefault:   cwDefault,
+		ContextWindowSupported: cwSupported,
 	}
 }
 
