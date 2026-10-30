@@ -52,3 +52,7 @@ server.exe
 # 编译产物（16MB 误提交过一次，20261021）
 /server
 /app.toml
+
+# Local 45 workflow sources are tracked; binaries stay local.
+/local-45/dist/
+!/local-45/*.md
