@@ -12,6 +12,30 @@
 - `local-45/deploy.sh`：显式选择部署组件、校验、备份、原子替换、重启、健康检查，失败尝试回滚。
 - 配置、API key、账号和运行状态仍留在 45，未下载到仓库。
 
+## 45 上的代理池（/opt/proxypool）
+
+45 自带的代理池服务不是本仓库的一部分，网关通过它的**桥接端口**接入：
+
+- 面板 `127.0.0.1:8080`（Bearer API Key 见 `/opt/proxypool/data/panel.db` 的 `users.api_key`），网关 `0.0.0.0:20000`（HTTP + SOCKS5，需代理池账号密码）。
+- `BRIDGE=1`：sing-box 把每个协议节点（ss/vmess/vless/trojan/hysteria2 等）桥成一个本地 SOCKS 入站，监听 `127.0.0.1:30000+`，端口记录在 `nodes.bridge_port`。网关要用的就是这个端口，不需要节点凭据，也不挑协议。
+- 池规模：约 5300 个节点、2800 个健康、1900 个已桥接。健康检查由代理池自己按 `HEALTH_INTERVAL=1800` 维护。
+
+接入方式（2026-10-31）：从 `nodes` 里挑 `enabled=1 and healthy=1 and bridge_port>0 and proto='socks5' and quality>=85 and latency_ms<1200` 的节点，按 US/JP/HK/SG/KR/GB/TW/FR 每区取前 3 个，共 19 条，以 `socks5h://127.0.0.1:<bridge_port>` 导入 workbuddy2api 的代理池：
+
+```bash
+curl -sS -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  --data '{"lines":"socks5h://127.0.0.1:30347\n..."}' \
+  http://127.0.0.1:8788/panel/api/proxies
+```
+
+15 个账号各绑一个固定出口（`PUT /panel/api/accounts/{uid}/proxy`，`{"mode":"fixed","proxy_id":"..."}`）：3 个 cn 账号绑 HK 节点（30365/30342/30338），12 个 global 账号分布在 US/JP/SG/KR/GB/TW/FR 节点上。绑定存在 `data/proxy-pool.json` 的 `bindings` 里，realm 默认出口（`realms`）未设置。
+
+注意：
+
+- 固定绑定没有回退：绑定的桥接节点挂了，该账号会直接报 `no healthy proxy available`，需要在面板里换绑或改成随机。
+- 桥接端口跟随代理池节点生命周期；节点被删/重排后端口可能消失，届时按上面同一条 SQL 重新挑节点导入并改绑。
+- 代理池自己的健康检查是 1800s 一轮，workbuddy2api 对导入的节点是 60s 一轮（默认 `health` 设置），两边口径不同。
+
 ## 第一次保存本地改动
 
 当前改动未提交；检查后提交到 `local/45`，这样以后合并上游时能保留路由与部署脚本。不要把 dist、配置或凭据提交进去。
