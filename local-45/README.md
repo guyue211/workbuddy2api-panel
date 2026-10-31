@@ -4,7 +4,8 @@
 
 - 上游： https://github.com/misakano7545/workbuddy2api-panel
 - remote：`upstream`（未配置自己的发布远程，不会推上游）。
-- 本地分支：`local/45`，起点 `v2026.10.30.1049` / `53735780d850c645d84c15f009324f4cc3153c65`，与 45 当前网关源码版本一致。
+- 本地分支：`local/45`，起点 `v2026.10.30.1049` / `53735780d850c645d84c15f009324f4cc3153c65`。
+- 2026-10-31：已合并上游 `main`（`8ab87d4`，含已发布 tag `v2026.10.31.845` 之后 7 个提交），45 现运行 `2026.10.31.1343`。
 - `cmd/server`：上游 Go 网关。
 - `cmd/wb-router`：本地跨域路由，包含 2026-10-30 修复的 SSE 额度错误识别、国际优先 → 国内回退和测试。由现有 `../wb-router` 复制；今后以本仓库这一份为维护入口，避免两处修改。
 - `local-45/build.sh`：构建 Linux amd64 网关和路由。
@@ -82,6 +83,20 @@ bash local-45/deploy.sh all
 国际额度耗尽时会返回 HTTP 200 + `event: response.failed`（`error.code=6004` / `insufficient_quota`），旧路由误判成功。新路由在提交下游响应前预检开头事件并回退国内；已收到正文/工具调用后不重试，避免重复执行。正常流字节完整回放。
 
 45 上已有该修复，22:43 实测国际失败 → 国内成功，带前缀和裸模型名均通过。部署备份：`/opt/backups/wb-router-streamfix-20261030T144252Z/`。
+
+## 2026-10-31 合并上游并更新网关
+
+上游 `main` 领先 13 个提交（代理池与按账号路由 #122、窗口用量调度 #112、`/v1/models` 补 models.dev 形状 #119、`web_search_result` 字段补齐 #121、登录设备码头族与 5.9.4 国际版对齐、面板请求上下文改弹窗等），已合并进 `local/45`，合并提交 `683cc5d`，无冲突。
+
+`go build ./...`、`go test ./...` 全绿后按 `bash local-45/build.sh 2026.10.31.1343` 构建，只部署网关（路由源码未变，`wb-router` 未替换）：
+
+```bash
+bash local-45/deploy.sh gateway
+```
+
+- 部署前版本 `2026.10.30.1049`，部署后 `2026.10.31.1343`，`workbuddy2api-panel` 于 05:45 UTC 重启，`wb-router` 未动。
+- 回滚备份：`/opt/backups/wb-local-45-YXWTlnFj/`。
+- 验证：两个 `/healthz` 均 healthy=15；经 18788 发非流式与流式各一次 `glm-5.3-flash`，均 200；`data/router.log` 记 `glm-5.3-flash -> global (200 ...)`；`data/request-logs/requests-2026-10-31.jsonl` 持续记录新版本产生的 `/v1/responses` 成功请求。
 
 ## 本次本地整理验证
 
