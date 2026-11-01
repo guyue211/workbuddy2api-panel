@@ -1,9 +1,11 @@
 // model_catalog.go context_length / max_output_tokens 四级查找链 + model.json
 // 本地缓存（任务书 model-json-dynamic）。
 //
-// 查找链（32a3c13 三级 → 四级，上游动态值永远权威不变）：
-//  1. 上游动态值（ModelInfo.ContextWindow/MaxTokens）——权威，永远压过 model.json
-//     （即使后者更新：上游才是权威，任务书 §清理）；
+// 查找链（32a3c13 三级 → 四级，再于 2026-11-01 加第 0 级手编覆盖）：
+//  0. model.json 里 source=manual 的条目——用户显式「以我为准」，压过上游动态值
+//     （实测 deepseek 上游报 128k 输出，实际 384k）；只对手编条目生效；
+//  1. 上游动态值（ModelInfo.ContextWindow/MaxTokens）——除第 0 级外权威，压过
+//     model.json 的其余条目（即使后者更新：上游才是权威，任务书 §清理）；
 //  2. 静态种子表（context_catalog.go 的 contextCapFallback，编译期兜底）；
 //  3. model.json 本地缓存（数据目录，含运行时从 models.dev 补的值 + 仓库种子
 //     embed 的初值）；损坏 → 降级种子并 WARN 不崩溃（手动维护入口的容错）；
@@ -134,9 +136,9 @@ func (c *modelCatalog) get(model string) (ModelCapEntry, bool) {
 	return e, true
 }
 
-// put 写一条缓存（第 4 级拉取成功后调用）并落盘。同模型已存在（用户手动维护过）
-// 仍覆盖——运行时拉取值采信 models.dev 官方源优先口径，比手编更可信；
-// 若不希望覆盖，删掉 model.json 里对应条目即可（加载后手编值只在本次进程生效）。
+// put 写一条缓存（第 4 级拉取成功后调用）并落盘。source=manual 的条目是用户显式
+// 覆盖（优先于上游动态值与 models.dev），运行时拉取不得覆盖它——否则手编值会在
+// 第一次 models.dev 回填时被悄悄改掉。
 func (c *modelCatalog) put(model string, e ModelCapEntry) {
 	if model == "" || !validCapEntry(e) {
 		return
@@ -144,6 +146,9 @@ func (c *modelCatalog) put(model string, e ModelCapEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.initLocked()
+	if old, ok := c.entries[model]; ok && old.Source == manualSource {
+		return
+	}
 	c.entries[model] = e
 	c.saveLocked()
 }
@@ -181,6 +186,20 @@ func SetModelCatalogPath(path string) {
 // modelCatalogGet 第 3 级：model.json 缓存命中（内含种子初值与损坏降级）。
 func modelCatalogGet(model string) (ModelCapEntry, bool) {
 	return catalogState.get(model)
+}
+
+// manualSource model.json 里「用户显式覆盖」条目的 source 标记。
+const manualSource = "manual"
+
+// manualCap 手编覆盖条目（source=manual）。它是查找链的**第 0 级**：上游目录报的值
+// 也可能与模型真实能力不符（实测 deepseek 系列上游报 128k 输出、models.dev 共识
+// 384k），用户手编即表示「以我为准」，故压过 remote。
+func manualCap(model string) (ModelCapEntry, bool) {
+	e, ok := modelCatalogGet(model)
+	if !ok || e.Source != manualSource {
+		return ModelCapEntry{}, false
+	}
+	return e, true
 }
 
 // modelCatalogPut 第 4 级写入：models.dev 拉到的值落缓存（含落盘）。
@@ -235,6 +254,9 @@ func ResetLookupChainForTest() {
 //  4. 全链 miss 且非负缓存 → 异步触发 models.dev 拉取（本次返回 DefaultContextWindow
 //     1M，不阻塞；拉到后写 model.json 供下次命中）。
 func ContextWindowListingV4(model string, remote int64, client *http.Client) int64 {
+	if e, ok := manualCap(model); ok && e.ContextLength > 0 {
+		return e.ContextLength // 第 0 级：用户手编覆盖
+	}
 	if remote > 0 {
 		return remote
 	}
@@ -262,6 +284,9 @@ func ContextWindowListingV4(model string, remote int64, client *http.Client) int
 // MaxOutputTokensListingV4 四级查找链的 max_output_tokens 决策（与 context 口径
 // 刻意不同：未知 → 省略，无「宁可高估」安全侧）。
 func MaxOutputTokensListingV4(model string, remote int64, client *http.Client) (int64, bool) {
+	if e, ok := manualCap(model); ok && e.MaxOutputTokens > 0 {
+		return e.MaxOutputTokens, true // 第 0 级：用户手编覆盖
+	}
 	if remote > 0 {
 		return remote, true
 	}

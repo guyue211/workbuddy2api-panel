@@ -2299,6 +2299,13 @@ func (c *Client) storeModelMaxOut(realm string, infos []ModelInfo) {
 			m[mi.ID] = mi.MaxTokens
 		}
 	}
+	// 手编覆盖（model.json source=manual）与 /v1/models 同口径：声明多少就补多少，
+	// 否则列表写 384k、出站默认仍按上游 128k 补，两边对不上。
+	for id := range m {
+		if e, ok := manualCap(id); ok && e.MaxOutputTokens > 0 {
+			m[id] = e.MaxOutputTokens
+		}
+	}
 	c.effortsMu.Lock()
 	defer c.effortsMu.Unlock()
 	if c.modelMaxOut == nil {
