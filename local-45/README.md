@@ -140,6 +140,21 @@ bash local-45/deploy.sh gateway
 
 `go build ./...`、`go vet`、`go test ./...` 全绿后按 `bash local-45/build.sh 2026.11.4.1432` 构建。路由源码未变，只需部署网关。
 
+## 45 上的模型上限手编覆盖（data/model.json）
+
+上游目录对 deepseek 系列报 128k 输出，实际 384k。`model.json` 里 `"source": "manual"`
+的条目是查找链第 0 级，压过上游动态值，且 models.dev 回填不会覆盖它。45 上现有三条：
+
+```json
+"deepseek-v4.1-flash":    {"context_length": 1000000, "max_output_tokens": 384000, "source": "manual"},
+"deepseek-v4.1-flash-sg": {"context_length": 1000000, "max_output_tokens": 384000, "source": "manual"},
+"deepseek-v4-pro":        {"context_length": 1000000, "max_output_tokens": 384000, "source": "manual"}
+```
+
+`-sg` 是 global 域 `deepseek-v4.1-flash` 的付费变体（`forcedModelAliases` 把请求改写过去），
+上游单独给它报了 128k，所以也要手编。改完 `systemctl restart workbuddy2api-panel` 生效；
+部署脚本不碰 `data/`，手编条目会跨版本保留。
+
 ## 本次本地整理验证
 
 已通过 `bash -n`、路由 `go test -race`、路由 `go vet`、全仓库 `go test ./...`。网关与路由的 Linux amd64 二进制已构建至 `local-45/dist/`，该目录被 Git 忽略。首次验证命令在旧工作目录执行时未找到脚本，改为明确进入本仓库后完整验证成功。部署脚本仅做语法检查，尚未实际执行；本次未再次部署或重启服务器。
