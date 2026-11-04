@@ -122,6 +122,24 @@ bash local-45/deploy.sh gateway
 - 回滚备份：`/opt/backups/wb-local-45-YXWTlnFj/`。
 - 验证：两个 `/healthz` 均 healthy=15；经 18788 发非流式与流式各一次 `glm-5.3-flash`，均 200；`data/router.log` 记 `glm-5.3-flash -> global (200 ...)`；`data/request-logs/requests-2026-10-31.jsonl` 持续记录新版本产生的 `/v1/responses` 成功请求。
 
+## 2026-11-04 合并上游（72 个提交，含 tag v2026.11.4.1120）
+
+上游 `main` 从 `1a81f25` 走到 `e6dd088`，合并进 `local/45`（合并提交 `701c484`）。主要变化：
+
+- 出站报文对齐官方真机：头名/顺序、`Connection` 头、TLS 指纹复刻 Node/OpenSSL（JA3+JA4），并有真机夹具对拍进 CI。新增配置 `upstream.tls_fingerprint`，缺省 `node`（不配也复刻），排障可设 `go` 回滚。
+- 代理路径：经代理的 HTTPS 先建隧道再走指纹握手（#135）；代理全被停用时随机绑定回落直连（#150）。
+- 流式与连接：关闭前读掉流尾、`Close` 幂等，上游连接可复用；上游心跳帧不再吞掉紧随的 Responses 事件（#158）；客户端断开不再记成上游断流。
+- 面板：账号分组、事件日志可清空/下拉记忆/20-30-50 条；鉴权改成「默认拒绝」；配置页可分层编辑 cn/global 的 `chat_base`/`billing_base`；默认网关档位可配置；事件日志区分客户端原始档位与网关补档。
+- 其他：补 Claude Code 的计数端点与模型别名通配；`model_fallback` 支持域前缀键；6020 带 `retry_after` 不再换号；到期加权不再低于关闭时权重、窗口默认 30 天。
+
+本地冲突两处，均在 `internal/server`：
+
+- `handler.go` 的 `modelAlias`：上游新增通配键（`claude-*`），本地有 `forcedModelAliases` 强制表。合并顺序定为「config 精确键 → config 通配键 → 内置强制表」，强制表仍保留 hidden/allowed 的绕过防护。
+- `model_alias_test.go`：两边新增的测试都保留。
+- `model_fallback_test.go` 的前缀键用例改用 glm：`global:deepseek-v4.1-flash` 现在被强制表改写成 `-sg`，第一跳就不是原模型，会掩盖前缀键降级的覆盖。
+
+`go build ./...`、`go vet`、`go test ./...` 全绿后按 `bash local-45/build.sh 2026.11.4.1432` 构建。路由源码未变，只需部署网关。
+
 ## 本次本地整理验证
 
 已通过 `bash -n`、路由 `go test -race`、路由 `go vet`、全仓库 `go test ./...`。网关与路由的 Linux amd64 二进制已构建至 `local-45/dist/`，该目录被 Git 忽略。首次验证命令在旧工作目录执行时未找到脚本，改为明确进入本仓库后完整验证成功。部署脚本仅做语法检查，尚未实际执行；本次未再次部署或重启服务器。
