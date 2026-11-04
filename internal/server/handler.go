@@ -136,16 +136,43 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 	}
 }
 
+// forcedModelAliases 网关内置的强制映射：键为 "realm:小写裸名"，值为目标模型名。
+//
+// INTL 的 deepseek-v4.1-flash 在客户端菜单里是免费行（x0.00），撞免费额度后客户端
+// 才会切到付费变体 deepseek-v4.1-flash-sg（ModelRateLimitCap.lines[].paidId）。
+// 网关若始终按免费 id 调上游，会在额度撞顶后频繁吃限流/降级；这里固定走付费变体，
+// 换稳定。目标必须带 global: 前缀——裸名会被 resolveModel 归到 cn，而 CN 目录里
+// 没有 -sg。
+//
+// 只对 global 域生效：CN 没有该变体。config aliases 里显式配置的键优先于本表
+// （modelAlias 先查热配置），因此运维仍可覆盖。
+var forcedModelAliases = map[string]string{
+	"global:deepseek-v4.1-flash": "global:deepseek-v4.1-flash-sg",
+}
+
 // modelAlias 查 aliases 映射（issue #30）：客户端名（剥 realm 前缀后的裸名，
 // 大小写不敏感）命中映射 → 返回真实模型名（原样，可再带 realm 前缀跨域指向）；
 // 未命中 → ("", false)。查找键与 livecfg.NormalizeModelAliases 的归一化口径配对：
 // realm+":"+小写裸名。
+//
+// 顺序：先查 config aliases（运维显式配置优先），再查 forcedModelAliases 内置强制表。
+// 强制表命中时，原模型若被 hidden 隐藏或不在 allowed 白名单，则不改写——让后续
+// hidden/allowed 检查按原模型拒绝，避免借目标名绕过黑名单/白名单。
 func (h *Handler) modelAlias(realm, bare string) (string, bool) {
 	if bare == "" {
 		return "", false
 	}
-	target, ok := h.loadLive().ModelAliases[strings.ToLower(realm)+":"+strings.ToLower(bare)]
-	return target, ok
+	key := strings.ToLower(realm) + ":" + strings.ToLower(bare)
+	if target, ok := h.loadLive().ModelAliases[key]; ok {
+		return target, ok
+	}
+	if target, ok := forcedModelAliases[key]; ok {
+		if h.hiddenModel(realm, bare) || !h.allowedModel(realm, bare) {
+			return "", false
+		}
+		return target, true
+	}
+	return "", false
 }
 
 // softCooldown 返回当前生效的软冷却基数（热改优先，<=0 回退默认）。

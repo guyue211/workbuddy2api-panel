@@ -86,7 +86,8 @@ func TestChatModelBusyWaitRescues(t *testing.T) {
 	})
 	p := testPoolWith(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "a", ExpiresAt: 9999999999})
 	// 80ms 的「14003 冷却」：语义与 CooldownModelBusy 同形，只是短到测试可等。
-	p.CooldownSoftForModel("g1", time.Second, time.Now().Add(80*time.Millisecond), "deepseek-v4.1-flash", "14003 model busy")
+	// 键用实际打上游的 -sg（global 域 deepseek-v4.1-flash 的强制付费变体）。
+	p.CooldownSoftForModel("g1", time.Second, time.Now().Add(80*time.Millisecond), "deepseek-v4.1-flash-sg", "14003 model busy")
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"global:deepseek-v4.1-flash","stream":false,"messages":[{"role":"user","content":"hi"}]}`)))

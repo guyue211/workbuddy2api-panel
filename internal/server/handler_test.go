@@ -1333,7 +1333,9 @@ func TestChatModelBusyEverywhereReturns503Retryable(t *testing.T) {
 	})
 	p := testPoolWith(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "at-global", ExpiresAt: 9999999999})
 	// 号还活着，只是这个模型在忙：写 (账号, 模型) 短窗口冷却，与 14003 落库路径一致。
-	p.CooldownModelBusy("g1", "deepseek-v4.1-flash", "14003 model busy")
+	// 冷却键必须是实际打上游的名字：global 域 deepseek-v4.1-flash 经强制映射后
+	// 走付费变体 -sg（见 forcedModelAliases），限流/冷却都记在 -sg 上。
+	p.CooldownModelBusy("g1", "deepseek-v4.1-flash-sg", "14003 model busy")
 
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
