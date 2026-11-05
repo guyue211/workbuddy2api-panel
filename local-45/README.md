@@ -152,6 +152,17 @@ bash local-45/deploy.sh gateway
 
 `go build ./...`、`go vet ./...`、`go test ./...` 全绿后按 `bash local-45/build.sh 2026.11.5.1731` 构建。路由源码未变，只需部署网关。
 
+## 2026-11-06 合并上游（16 个提交，含 tag v2026.11.5.2306）
+
+上游 `6f19b76` → `6df19e5`，无冲突，合并提交 `54c7311`。这批全是 11-05 那轮视频/图片/MCP 的修复与规范对齐，未改 config 结构。
+
+- **视频回执改成 OpenAI Video 资源形状**：`status` 归一 `queued/in_progress/completed/failed`，`seconds` 改字符串，`error` 改 `{code,message}`，补 `progress`/`expires_at`/`remixed_from_video_id`；新增 `POST /v1/videos`、`GET /v1/videos/{id}/content`，与原路径共用实现。按旧形状解析的客户端会受影响。
+- **图片**：`response_format=b64_json` 现在真回 base64（网关取直链自转，取图失败保留 URL 并记日志）；`n>1` 直接 400（上游只回一张，不再静默少给）。
+- **视频任务查询不再扇出整池**（#177）：台账未命中时走有界探测——负缓存 30s + 游标轮转、单次最多 5 个账号、全局 30 次/分钟；429/5xx 立即停手并全局暂停 30s，不罚账号。台账命中但账号已不在池中直接 404。
+- **重启后收养的视频任务不重复记账**（#175，实测曾重复计 57.14 积分）；MCP 无 `id` 的请求按通知回 202（#173）；客户端断开只看请求 ctx（#166）；裁水印先读文件头查像素上限（#168）；清空归档的请求通道改无缓冲（#170）。
+
+`go build ./...`、`go vet ./...`、`go test ./...` 全绿后按 `bash local-45/build.sh 2026.11.6.032` 构建。路由源码未变，只需部署网关。
+
 ## 45 上的模型上限手编覆盖（data/model.json）
 
 上游目录对 deepseek 系列报 128k 输出，实际 384k。`model.json` 里 `"source": "manual"`
