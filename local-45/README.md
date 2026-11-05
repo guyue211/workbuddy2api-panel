@@ -140,6 +140,18 @@ bash local-45/deploy.sh gateway
 
 `go build ./...`、`go vet`、`go test ./...` 全绿后按 `bash local-45/build.sh 2026.11.4.1432` 构建。路由源码未变，只需部署网关。
 
+## 2026-11-05 合并上游（9 个提交，含 tag v2026.11.5.1428）
+
+上游 `e6dd088` → `6f19b76`，无冲突，合并提交 `486da9c`。主要变化：
+
+- **出视频端点**（`/v1/videos` 等）+ 任务查询，国际版也能出片、列表不再隐藏 global 视频模型（#162）。
+- **MCP 端点**（生图 / 改图 / 出视频 / 查任务）。
+- **可选水印裁切**：`features.watermark_strip_enabled`，默认关闭；回读图片不跟随重定向（白名单只校验首跳主机）。
+- **tools 脱敏**（借鉴参考仓库）+ 轮询指纹跳过。
+- 面板：配置页分域 tab 不再自我隐藏，修四处缩进 /「卡中卡」排版；签到响应回显真实 realm（不再写死 `"cn"`）。
+
+`go build ./...`、`go vet ./...`、`go test ./...` 全绿后按 `bash local-45/build.sh 2026.11.5.1731` 构建。路由源码未变，只需部署网关。
+
 ## 45 上的模型上限手编覆盖（data/model.json）
 
 上游目录对 deepseek 系列报 128k 输出，实际 384k。`model.json` 里 `"source": "manual"`
