@@ -217,3 +217,94 @@ bash local-45/deploy.sh gateway
 ### wb-router 未替换
 
 45 上跑的仍是 `~/work/ai/wb-router` 那份 10.5 MB 构建（`4fe27e01…`），其 `main.go`/`stream.go`/`stream_test.go` 与本仓库 `cmd/wb-router/` 逐字节相同，行为一致；差别只在构建来源（独立模块 `go 1.21`、未 strip、无 vcs 戳）。要让它变成仓库产物，跑 `bash local-45/deploy.sh router`，代价是路由重启、在途请求中断一次。
+
+## 2026-11-08 截断复查：客户端限额被当成「它只要这么短」
+
+「经常半路截断」的复查结论与修复。**根因不在上游，在续写闸门**：客户端只要带了
+`max_tokens`，`continue.go` 就按「客户端有意只要这么多」直接收尾，不再续接。
+
+### 实测（影子实例直连，global:deepseek-v4.1-flash-sg，同一句「数到 20000」）
+
+| 请求 | completion | finish | 结果 |
+| --- | --- | --- | --- |
+| `max_tokens=32000` | 32000 整 | length | 正文 47853 字符停在 `9792,` 之后，**半句，无续写** |
+| `max_tokens=40000` | 40000 整 | length | 同上（半句） |
+| 不带额度（网关按目录补 384000） | 60660 | stop | 数到 12000 后自然收尾 |
+| 修复后 `max_tokens=32000` | 36594（两段） | stop | 数到 12000 + `DONE`，**完整** |
+
+结论两条：
+
+1. **上游没有 32000 的硬上限**（`continue.go` 开头那条是 CN 域旧实测，global 域不复现）。
+   上游是「客户端给多少就在多少处切」——`max_tokens=40000` 就切在 40000。
+2. 所以「客户端限额」在 32000 以上这一档不代表「只要这么短」，只代表「先给个上限」。
+   按它收尾等于把上限当成意愿，用户看到的就是半路截断。目录 `/v1/models` 对外报
+   `max_output_tokens=384000`（手编覆盖），照着它填 `max_tokens` 的客户端全都落进这一档。
+
+### 修复（`internal/server/continue.go`）
+
+- `continueClientLongAnswer = 32000`：客户端额度 ≥ 它时按「要长文」处理，`finish=length`
+  继续续写，直到正文 token 写够客户端额度（思考不占这份预算，见 `totalText`）。
+  额度小于它的仍按客户端意图收尾（8192/4096 多半是「就要一小段」）。
+- `outputCapped` 增加第二道闸：`totalText() >= clientLimit` 时停止续写（不会无限续）。
+- `continueCapped` 只在 `finish=length` 时置位——正常收尾（`finish=stop`）不再被日志
+  写成「按截断收尾」（影子实测踩到：客户端看到 stop，日志说截断）。
+
+新增/改写测试：`TestContinueAllowedWhenClientLimitBeyondSegmentCap`、
+`TestContinueStillBlockedForSmallClientLimit`、`TestOutputCappedByClientTextBudget`、
+`TestContinueCappedNotFlaggedOnNormalStop`。`go build ./...`、`go vet ./...`、
+`go test ./...` 全绿。
+
+### 未做
+
+- 工具参数截断（半个 JSON）仍不续（`continue.go` 的 ponytail 注记）：拼接残缺
+  `tool_calls` 比不续更糟。agent 客户端在这一形态下仍会看到「回合结束但没有工具调用」。
+- 部署：本次只验证到影子实例，未动 45 上的二进制。要上线按
+  `bash local-45/build.sh <版本号>` 后 `bash local-45/deploy.sh gateway`。
+
+## 2026-11-08 续：默认档位一致性 + 工具参数截断取证
+
+### 默认档位：两处写死的缺省值打架
+
+`thinking.default_effort` 的缺省值此前有两个版本：
+
+- `internal/upstream/effort_policy.go` 的 `Normalized()`：空 → `high`（附实测：同一
+  8192 额度下 high 的正文比 max 多 70%）；
+- `cmd/server/config.go` 的 `Default()` 与 `normalizeThinking()`：空 → `max`。
+
+config 层先填值，policy 层的 `high` 永远看不到，于是**上游 ffca1da 想要的 high 从来没
+生效过**，45 上一直是 `effort=- ->max`。
+
+改法：新增 `upstream.DefaultGatewayEffort = "high"` 作为唯一事实来源，两处都引用它；
+`TestThinkingDefaults` 改成断言 high。
+
+**45 的行为没变**：部署前在 `config.json` 显式写了 `"default_effort": "max"`
+（备份 `/opt/backups/config.json.before-effort-pin-*`），部署后首条流水仍是
+`effort=- ->max`。要切 high 就改这一行，保存热生效：
+
+```bash
+ssh tokyo112 'python3 - <<EOF
+import json; p="/opt/services/workbuddy2api-panel/config.json"
+c=json.load(open(p)); c["thinking"]["default_effort"]="high"
+json.dump(c,open(p,"w"),ensure_ascii=False,indent=2)
+EOF'
+```
+
+理由：max 思考更深、单轮更贵；high 正文更多、更省。45 是自用 agent 池，保持现状由
+使用者决定，不在代码修复里顺手改掉。
+
+### 工具参数截断（V2「剩余参数改写」）：取证后不做
+
+两次探针（`probe_tool.py`，声明 `write_file` 工具）：
+
+| 请求 | completion | finish | 工具参数 |
+| --- | --- | --- | --- |
+| `max_tokens=600`，写 8000 字 | 7307 | tool_calls | 11608 字节，可解析 |
+| `max_tokens=32000`，写 60000 字 | 21653 | tool_calls | 35223 字节，可解析 |
+
+`max_tokens=600` 那条没被切，是因为网关的输出预算下限先把额度抬到 8192
+（`output_budget.go`）；两条都是模型自己收尾，没有撞上限。线上日志里
+`[continue] 跳过：本段含工具调用分片` 至今 **0 条**。
+
+结论：**V2 不做**。判据写在这里——等这条日志真的开始出现（说明有客户端稳定撞上
+参数截断），再做「残缺 arguments 作前缀 + 只接受连续片段」的续写。现在做等于给一个
+没发生过的形态写拼接逻辑，风险（模型重发开头、提前补 `}`）大于收益。
