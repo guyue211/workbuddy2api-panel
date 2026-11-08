@@ -560,7 +560,9 @@ func Default() *Config {
 	// 思考档位策略缺省：网关按模型最高档补缺档请求，但客户端显式档位优先
 	// （client_priority=true），且不覆盖客户端的关闭思考意图（override_scope=level）。
 	c.Thinking.Enabled = true
-	c.Thinking.DefaultEffort = "max"
+	// 与 EffortPolicy.Normalized 共用同一个常量：两处各自写死过 max/high，config 层
+	// 先填值把 policy 的缺省盖掉，线上于是按 max 跑（思考吃光预算 → 正文半句）。
+	c.Thinking.DefaultEffort = upstream.DefaultGatewayEffort
 	c.Thinking.ClientPriority = true
 	c.Thinking.OverrideScope = "level"
 	c.Pool.MaxInFlight = 3
@@ -1233,7 +1235,7 @@ func (c *Config) normalize() error {
 func (c *Config) normalizeThinking() error {
 	c.Thinking.DefaultEffort = strings.ToLower(strings.TrimSpace(c.Thinking.DefaultEffort))
 	if c.Thinking.DefaultEffort == "" {
-		c.Thinking.DefaultEffort = "max"
+		c.Thinking.DefaultEffort = upstream.DefaultGatewayEffort
 	}
 	if c.Thinking.DefaultEffort == "off" || !upstream.IsEffortLevel(c.Thinking.DefaultEffort) {
 		return fmt.Errorf("thinking.default_effort: %q 不是合法档位（max 或 low/medium/high/xhigh 等）", c.Thinking.DefaultEffort)

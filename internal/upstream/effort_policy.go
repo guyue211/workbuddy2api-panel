@@ -41,6 +41,17 @@ func isOffEffort(s string) bool {
 	return false
 }
 
+// DefaultGatewayEffort 网关补缺档时用的默认思考档（"high"）。
+//
+// **唯一事实来源**：config 层（cmd/server 的 Default/normalizeThinking）与
+// EffortPolicy.Normalized 都必须用它，不许各自写死。此前两边不一致——policy 缺省
+// high、config 层缺省 max，而 config 层先填值，policy 的 high 永远看不到，线上于是
+// 一直按 max 跑（max 把输出预算烧在思考上，正文只剩半句，见 Normalized 的实测）。
+//
+// 选 high 不选 max：思考与正文共用一份输出额度；实测同一 8192 额度下 high 的正文
+// 比 max 多 70%（3236 vs 1906 token）。确实要最深推理时在 config 里显式写 max。
+const DefaultGatewayEffort = "high"
+
 // EffortPolicy 网关思考档位策略（config thinking 节的运行时形态）。
 //
 // 字段均带 json tag：面板保存后按 config 原样落盘/回显，热更新走同一个结构。
@@ -66,7 +77,7 @@ func (p EffortPolicy) Normalized() EffortPolicy {
 		//   high → think 4068 / 正文≈3236 token（6011 字），正文多 70%
 		// 与 hub（wb_proxy.default_reasoning_effort_mode）的默认 high 同口径：那里
 		// 明确记着「强补 high 让 deepseek 把整轮花在 reasoning 上、偶尔无正文」（#508）。
-		p.DefaultEffort = "high"
+		p.DefaultEffort = DefaultGatewayEffort
 	}
 	p.OverrideScope = strings.ToLower(strings.TrimSpace(p.OverrideScope))
 	if p.OverrideScope != OverrideScopeAll {
