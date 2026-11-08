@@ -181,3 +181,39 @@ bash local-45/deploy.sh gateway
 ## 本次本地整理验证
 
 已通过 `bash -n`、路由 `go test -race`、路由 `go vet`、全仓库 `go test ./...`。网关与路由的 Linux amd64 二进制已构建至 `local-45/dist/`，该目录被 Git 忽略。首次验证命令在旧工作目录执行时未找到脚本，改为明确进入本仓库后完整验证成功。部署脚本仅做语法检查，尚未实际执行；本次未再次部署或重启服务器。
+
+## 2026-11-08 合并上游（43 个提交，含 tag v2026.11.8.1203）
+
+上游 `6df19e5` → `4b0a3b4`（tag `v2026.11.8.1203` 打在 `29db878` 上），合并进 `local/45`，合并提交 `a51c6b2`，**无冲突**。`git merge-tree` 预演与实合并都干净，`cmd/wb-router` 在这 43 个提交里一行未动。
+
+主要变化：
+
+- **输出预算与续写**（`2b9b773`/`562d0d8`/`34a3ae6`/`e54c6e0`/`29db878`）：高档位思考把额度吃光时按档位抬输出预算下限；抬过额度的请求在 `finish=length` 处自动续接；续写闸门从「最多 3 段」改成「累计输出上限」，低档位长文不再停在半句。新增 `internal/upstream/output_budget.go` 与 `continue_*_test.go`。
+- **默认档位改 high**（`ffca1da`）：`EffortPolicy.Normalized()` 缺省值 `max` → `high`；`/v1/responses` 只有 reasoning item、正文与工具调用都为空时改判失败（流式 `response.failed` code `empty_reasoning_only`、非流式 502），不再回 `response.completed` 骗客户端收尾。
+- **reqlog / 面板全链路区分 `model_eff`**（`ee5ae70`/`efe64fd`/`b674f71`）：降级前后模型分开记，按线协议原值、不自造域前缀。
+- **稳定性**：上游断流补截断终态（`84a48d9`）、`11134` 供应商过载不罚号不换号并保留会话粘性（`4830686`）、入站请求体上限与 `11140` 风控连坐保护（`b494426`）。
+- **认证**：支持新版桌面端的 `$wbEncrypted` auth 文件（`c7cc216`），回写只封「读入时确实加密」的字段（`97d3f25`）。
+- **性能**：请求体只解析一次、指纹预检去掉 RE2 大小写折叠（`4b0a3b4`/`fe51fd6`），`WB2API_PPROF` 诊断开关（`b42712c`）。
+
+`go build ./...`、`go vet ./...`、`go test ./...` 全绿后按 `bash local-45/build.sh 2026.11.8.1456` 构建。路由源码未变，只部署网关：
+
+```bash
+bash local-45/deploy.sh gateway
+```
+
+- 部署前 `2026.11.6.032` → 部署后 `2026.11.8.1456`，`workbuddy2api-panel` 于 06:57:09 UTC（14:57 CST）重启；`wb-router` 未动（已连续运行 8 天 16 小时）。
+- 部署后 `wb2api` 的 sha256 `7cdd3cff…f746ab` 与本地 `local-45/dist/wb2api` 一致。
+- 回滚备份：`/opt/backups/wb-local-45-0AMJl3NC`。
+- 验证：两个 `/healthz` 均 `healthy=17/17`；经 8788 发非流式与流式各一次 `glm-5.3-flash`，均 200；`data/router.log` 记 `glm-5.3-flash -> global (200 ...)`；重启后 ERR/WARN 计数 0。
+
+### 45 上 default_effort 实际仍是 max
+
+`ffca1da` 只改了 `internal/upstream/effort_policy.go` 的 `Normalized()` 与 `config.example.json`；`cmd/server/config.go:563` 和 `normalizeThinking()`（`config.go:1236`）仍把空值归一成 `max`。45 的 `config.json` 没写 `thinking.default_effort`，配置层先填 `max`，`Normalized()` 看到的是非空值，不会改 high。
+
+部署后实测：`/panel/api/models` 的 `gateway_effort_wanted` = `max`；请求记录 `reasoning_effort=max`、`reasoning_effort_requested` 为空；流水行仍是 `effort=- ->max`，与部署前一致。
+
+要真正生效，在 45 的 `config.json` 的 `thinking` 节显式写 `"default_effort": "high"`（或面板「模型与档位」页逐模型写 `thinking.model_defaults`），保存即热生效，不必重启。
+
+### wb-router 未替换
+
+45 上跑的仍是 `~/work/ai/wb-router` 那份 10.5 MB 构建（`4fe27e01…`），其 `main.go`/`stream.go`/`stream_test.go` 与本仓库 `cmd/wb-router/` 逐字节相同，行为一致；差别只在构建来源（独立模块 `go 1.21`、未 strip、无 vcs 戳）。要让它变成仓库产物，跑 `bash local-45/deploy.sh router`，代价是路由重启、在途请求中断一次。
