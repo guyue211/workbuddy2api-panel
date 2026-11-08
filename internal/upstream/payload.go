@@ -163,6 +163,10 @@ func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][
 		// 也可能返回空）。
 		effort = policyEffort
 	}
+	// 输出预算下限（见 output_budget.go）：客户端既要高档位思考、又把 max_tokens
+	// 给得比「这一档的思考都装不下」还小的时候，抬到该档的下限。抬的是上限不是
+	// 目标长度——模型写完了照样停，只是不再被思考挤掉正文。
+	ensureMinOutputBudget(obj, effort, maxOut)
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
@@ -559,9 +563,18 @@ func dropReasoningContentParts(obj map[string]any) {
 	obj["messages"] = out
 }
 
+// consoleSystemFallback 兜底 system 正文：只写行为约定，不写身份（issue #187）。
+const consoleSystemFallback = "Follow the user's instructions and respond in the user's language."
+
 // ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11-128）：
-// 首条消息非 system 时在 messages 最前补一条 fallback system（"You are a helpful assistant."）。
-// 仅对 global 请求调用（CN 现状不动；即使首条就是 system 也不重复注入）。
+// 首条消息非 system 时在 messages 最前补一条 fallback system。仅对 global 请求调用
+// （CN 现状不动；即使首条就是 system 也不重复注入）。
+//
+// 兜底文本**不声明身份**（issue #187）：上游的判据只是「首条必须是 system」，正文不参与
+// 校验；写成「You are a helpful assistant.」等于网关自己往对话里插一句身份声明，与客户端
+// harness 自带的人设并列时，模型会把它当成外部注入而拒绝执行。这里只声明行为约定，
+// 不碰身份。
+//
 // body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不在这里二次错误化）。
 func ensureConsoleSystem(body []byte) []byte {
 	if len(body) == 0 {
@@ -581,7 +594,7 @@ func ensureConsoleSystem(body []byte) []byte {
 			return body // 首条已是 system：不注入
 		}
 	}
-	obj["messages"] = append([]any{map[string]any{"role": "system", "content": "You are a helpful assistant."}}, msgs...)
+	obj["messages"] = append([]any{map[string]any{"role": "system", "content": consoleSystemFallback}}, msgs...)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return body
