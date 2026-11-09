@@ -1604,6 +1604,11 @@ func (w *responsesWriter) emitCompleted() error {
 	// 判据与 hub 实现一致（wb_proxy.reasoning_only_response）：无正文、无工具调用、
 	// 有思考、且不是 length 截断（截断走 incomplete，不抢占）。
 	if w.reasoningOnlyNoOutput() {
+		// 留痕：流式失败此前完全不打日志，客户端报「本轮运行失败」时运维侧无从查证
+		// （面板与 service.log 都只有一条成功的流水）。带上判据所需的全部事实，
+		// 一眼分清「模型只想不说」与「正文被管线吞掉」。
+		log.Printf("WARN: [responses] 流式：上游只返回思考、正文与工具调用皆空 → response.failed empty_reasoning_only（model=%s think=%dB tools=%d status=%q）",
+			w.x.model, w.x.reasoningText.Len(), len(w.x.toolOrder), w.x.status)
 		return w.emitFailed(map[string]any{
 			"code":    "empty_reasoning_only",
 			"type":    "upstream_error",
