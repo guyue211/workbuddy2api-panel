@@ -1106,10 +1106,9 @@ func TestThinkingDefaults(t *testing.T) {
 		t.Error("thinking.enabled default should be true")
 	}
 	// 缺省 high（upstream.DefaultGatewayEffort），不是 max：思考与正文共用一份输出
-	// 额度，max 会把预算烧在思考上、正文只剩半句。此前 config 层写死 max，把
-	// EffortPolicy 的 high 缺省盖掉了（见 effort_policy.go 的 DefaultGatewayEffort）。
-	if upstream.DefaultGatewayEffort != "high" || c.Thinking.DefaultEffort != upstream.DefaultGatewayEffort {
-		t.Errorf("thinking.default_effort=%q want high（upstream.DefaultGatewayEffort）", c.Thinking.DefaultEffort)
+	// 额度，max 会把预算烧在思考上、正文只剩半句。
+	if c.Thinking.DefaultEffort != upstream.DefaultGatewayEffort {
+		t.Errorf("thinking.default_effort=%q want %q", c.Thinking.DefaultEffort, upstream.DefaultGatewayEffort)
 	}
 	if !c.Thinking.ClientPriority {
 		t.Error("thinking.client_priority default should be true")

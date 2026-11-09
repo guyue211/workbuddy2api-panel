@@ -55,6 +55,5 @@ server.exe
 /server
 /app.toml
 
-# Local 45 workflow sources are tracked; binaries stay local.
+# Local build artifacts (local-45/build.sh 的产物，不进仓库)
 /local-45/dist/
-!/local-45/*.md
