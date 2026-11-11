@@ -359,3 +359,31 @@ PR #195 已被上游合入（`6e7fe62`/`877324f`/`7028676`），三个提交都�
 `2026.11.10.1859`（sha `53daeef2…`），重启后 `ERR: 0`、`WARN: 1`（唯一一条是
 `credit floor: sticky acct=0147ce11 credits=28 < floor=100, unbind`，积分保底正常
 让位，不是故障），两端口 `healthy=23/27`。回滚备份 `/opt/backups/wb-local-45-Z5QDaOWk`。
+
+## 2026-11-11 合并上游 main（6 个提交，本地经 45 中转）
+
+本机到 GitHub 不通（`curl https://github.com` 超时、`git fetch` 报 SSL connection
+timeout），改用 45 中转：45 上 `git clone --bare` 上游 → `git bundle create
+v2026.11.11.832..main`（33 KB）→ scp 回本机 → `git fetch <bundle>`。
+
+合并提交 `856b5a7`，无冲突，`go build`/`go vet`/`go test ./...` 全绿。
+
+- `2b210e9` 请求级错误不再解绑会话粘性：`fail()` 把「释放租约」和「解绑会话」绑在
+  一起，而 11151/11-128/11115/图片无效/工具不匹配这些错误与账号无关（同一个 body
+  换任何号都会撞）。此前报错一次，前缀缓存就一直不生效。
+- `baf9155` 收尾误救两道闸门：线上 08:00–09:00 实测 toolonly 救援 29 次试续、
+  **29 次采纳、0 次回滚**，采纳率 100% 说明它在给每个 agent 回合追加一次工具调用，
+  客户端永远结束不了回合。加两道闸：「已写完的答复」不救、重发上一次调用不采纳。
+- `1adfa52` 签到遇「请稍后重试」不再直接放弃，10/40 分钟后自动补签。
+- `4f6adc0`+`a439202` 轮询热重载在 `reload_delete_confirm>1` 时永不删号（指纹门把
+  缺席计数挡在外面，删号静默失效）。
+- `cf2b80f` 到期窗口用例锚到日界，修掉每天 CST 00:00–12:00 必红。
+
+### 部署
+
+`2026.11.11.1721`（sha `ba601ee4…`），重启后 `ERR: 0`、`WARN: 0`，
+`account_priority` 6 个账号仍在，热重载首轮 `updated=24`。回滚备份
+`/opt/backups/wb-local-45-MNexyLzF`。
+
+池子：24 个账号、healthy 15（cn 11 / global 4）。global 侧只有 4 个健康号，是
+11-11 上午两个号被 11140 限制并出池之后的余量。
