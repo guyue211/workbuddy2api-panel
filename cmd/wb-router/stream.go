@@ -91,12 +91,16 @@ func inspectEvent(event string, data []byte) (retry, wait bool) {
 		}
 		json.Unmarshal(rawError, &e)
 		code := strings.Trim(string(e.Code), "\"")
+		// 账号受限可能被网关包成 no_healthy_account；保留限制保护，不跨区重试。
+		if code == "account_restricted_hold" || bytes.Contains(rawError, []byte("11140")) {
+			return false, false
+		}
 		switch e.Type {
 		case "insufficient_quota", "rate_limit_error", "rate_limit_exceeded", "overloaded_error", "server_error", "model_unavailable":
 			return true, false
 		}
 		switch code {
-		case "402", "429", "500", "502", "503", "504", "6004", "rate_limit_exceeded", "insufficient_quota", "model_unavailable":
+		case "402", "429", "500", "502", "503", "504", "6004", "rate_limit_exceeded", "insufficient_quota", "model_unavailable", "no_healthy_account":
 			return true, false
 		}
 		return false, false // 鉴权、参数等错误不能靠换域修复。

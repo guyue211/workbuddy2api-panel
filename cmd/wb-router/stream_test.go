@@ -15,6 +15,9 @@ func TestStreamFallback(t *testing.T) {
 		fallback          bool
 	}{
 		{"responses quota", "/v1/responses", "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":6004,\"type\":\"insufficient_quota\"}}}\n\n", true},
+		{"responses pool empty", "/v1/responses", "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"no_healthy_account\",\"type\":\"api_error\"}}}\n\n", true},
+		{"chat pool empty", "/v1/chat/completions", ": heartbeat\n\ndata: {\"error\":{\"code\":\"no_healthy_account\",\"type\":\"api_error\"}}\n\n", true},
+		{"restriction hold stays local", "/v1/responses", "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"account_restricted_hold\",\"type\":\"api_error\"}}}\n\n", false},
 		{"heartbeat then error", "/v1/chat/completions", ": heartbeat\n\ndata: {\"error\":{\"type\":\"rate_limit_error\"}}\n\n", true},
 		{"init then failure", "/v1/responses", "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.failed\ndata: {\"response\":{\"error\":{\"type\":\"server_error\"}}}\n\n", true},
 		{"messages overload", "/v1/messages", "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n", true},
