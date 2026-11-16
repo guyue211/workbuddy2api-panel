@@ -13,8 +13,13 @@ import (
 )
 
 type Pool struct {
-	mu      sync.RWMutex
-	byUID   map[string]*entry
+	mu    sync.RWMutex
+	byUID map[string]*entry
+	// rules 模型规则表（id → 规则）。面板「模型规则」页维护，随 state.json 落盘。
+	rules map[string]ModelRule
+	// parked 被账号目录热重载移出池的条目（uid → 原条目，见 ParkMany）。文件回来时原样复活，
+	// 禁用、暂停、分组、冷却都还在；随 state.json 的 parked_accounts 落盘，文件缺席期间重启也不丢。
+	parked  map[string]*entry
 	stateFp string
 	dirty   atomic.Bool // 内存有变更待落盘
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
@@ -67,6 +72,11 @@ type Pool struct {
 	// 循环依赖与分层破坏），nil 时倍率兜底不生效（退化为仅本地台账判定）。
 	// 仅在持 p.mu 时由 floorBlockedForRealmModel 调用；回调不得反向调用 Pool 方法。
 	modelRateOf func(realm, model string) string
+	// exclusiveModelOf 报告 (域, 模型) 是否「免费号调不通」（modelTiers accessMode=exclusive）；
+	// exclusivePaidOf 报告 uid 是否付费号（第二返回值 false = 不知道）。
+	// 同为注入项、同为 nil = 关闭（缺省）。只在持锁时由 exclusiveBlockedForRealmModel 调用。
+	exclusiveModelOf func(realm, model string) bool
+	exclusivePaidOf  func(uid string) (bool, bool)
 	// 加权路由的闲置补偿调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
@@ -344,6 +354,17 @@ func (p *Pool) SetCreditFloor(n int64) {
 	}
 }
 
+// SetExclusiveModels 注入「免费号调不通」的模型查表与账号付费状态查表
+// （main 用 upstream.Client.ModelExclusive / PaidUser 装配）。两者任一为 nil 即关闭闸门。
+//
+// 只在**知道**账号免费时才跳过：没观测过付费状态的号照旧参与（宁可按现状打一次上游，
+// 也不因为缺数据把能用的号排除）。
+func (p *Pool) SetExclusiveModels(modelOf func(realm, model string) bool, paidOf func(uid string) (bool, bool)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.exclusiveModelOf, p.exclusivePaidOf = modelOf, paidOf
+}
+
 // SetModelRateOf 注入上游目录积分倍率查表（main 用 upstream.Client.ModelRate 装配）。
 // 供积分保底兜底判定「未实测过的模型是否收费」——本地台账无观测时，不能因为
 // 「没学过」就无条件放行，否则高价新模型会把触底号一次性打穿（kimi-k3-1 实案：
@@ -580,7 +601,73 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 		e.a = a // 保留 credits/cooling 状态
 		return
 	}
+	if e, ok := p.parked[a.UID]; ok {
+		// 热重载移出过的号回来了：沿用原条目，人工设的禁用/暂停/分组不因文件挪开一阵就丢。
+		delete(p.parked, a.UID)
+		e.a = a
+		p.byUID[a.UID] = e
+		p.dirty.Store(true)
+		return
+	}
 	p.byUID[a.UID] = &entry{a: a}
+}
+
+// maxParked 暂存条目上限：外部脚本反复轮换大批账号时不让内存无界增长；满了就不再暂存（照旧删）。
+const maxParked = 4096
+
+// ReconcileResult Reconcile 对单个账号做了什么。
+type ReconcileResult int
+
+const (
+	ReconcileUnchanged ReconcileResult = iota // 池里已有且磁盘上的令牌不比内存新
+	ReconcileAdded                            // 新入池（含从暂存复活）
+	ReconcileUpdated                          // 池里已有，换上了磁盘上更新的令牌
+)
+
+// Reconcile 账号目录热重载的入池：新号加入；已在池的号只在磁盘令牌更新时原地更新
+// （auth.AdoptNewer），不换指针——换指针会把刚刷新的令牌盖回磁盘上的旧值。
+//
+// 原地更新在 p.mu 之外做：auth 的锁不嵌在池锁里，不引入新的锁序。
+func (p *Pool) Reconcile(a *auth.Auth) ReconcileResult {
+	p.mu.Lock()
+	e, ok := p.byUID[a.UID]
+	if !ok {
+		p.upsertLocked(a)
+		p.mu.Unlock()
+		return ReconcileAdded
+	}
+	cur := e.a
+	p.mu.Unlock()
+	if cur.AdoptNewer(a) {
+		return ReconcileUpdated
+	}
+	return ReconcileUnchanged
+}
+
+// ParkMany 把账号移出池并暂存其状态（热重载用），只落盘一次；返回实际移出的 uid。
+// 与 RemoveMany 的差别只在暂存：面板手动删除是「不要了」，热重载删除是「文件暂时不见了」。
+func (p *Pool) ParkMany(uids []string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var removed []string
+	for _, uid := range uids {
+		e, ok := p.byUID[uid]
+		if !ok {
+			continue
+		}
+		delete(p.byUID, uid)
+		if len(p.parked) < maxParked {
+			if p.parked == nil {
+				p.parked = map[string]*entry{}
+			}
+			p.parked[uid] = e
+		}
+		removed = append(removed, uid)
+	}
+	if len(removed) > 0 && !p.saveLocked() {
+		p.dirty.Store(true)
+	}
+	return removed
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

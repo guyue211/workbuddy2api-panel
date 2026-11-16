@@ -504,6 +504,12 @@ func ParseRetryAfter(h http.Header) (time.Duration, bool) {
 	return 0, false
 }
 
+// IsProviderOverloaded 报告 body 是否为 11134「模型供应商暂时不可用」。它与 6020/6021
+// 同归 ErrUpstreamBusy，但成因是供应商过载而不是排队：给客户端的文案要区分（队列满的
+// 措辞会让人去查排队），而且供应商过载时「换个模型」是有效出路，排队时不是。
+// 只认结构化 code，文案单独出现仍是普通 5xx。
+func IsProviderOverloaded(body string) bool { return hasBusinessCode(body, "11134") }
+
 // parseQueueRetryAfter 从排队/容量信封的 body 抽上游明示的重试等待时长。
 // 两种形态都认（整数秒，超 retryAfterSanity 按异常值封顶）：
 //
@@ -713,7 +719,7 @@ func Classify(status int, body string) ErrKind {
 	// vs 换号 0–12%）。
 	// 归 ErrUpstreamBusy = 不罚号 + body 侧解析 retry_policy.retry_after 后不轮转，
 	// 与 6020/6021 同一族（上游容量信号，自带重试口径）。
-	if hasBusinessCode(body, "11134") {
+	if IsProviderOverloaded(body) {
 		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
@@ -904,6 +910,13 @@ type Client struct {
 	// 供出站请求体补默认 max_tokens：上游对缺失限额的请求套保守默认（实测
 	// 32000），Codex 等不发限额的客户端写大文件会被无声截断。与 efforts 共用锁。
 	modelMaxOut map[string]map[string]int64
+	// exclusive 该域里「免费号调不通」的模型（modelTiers 的 accessMode=exclusive）。
+	// 与 modelRates 同口径：目录刷新即整体替换，共用锁。
+	exclusive map[string]map[string]bool
+	// paidByUID 各账号「是不是付费号」（billing summary 的 IsPaidUser）。只在拿到
+	// 该字段时写入（目前只有 global 的 summary 给）；缺条目 = 不知道。
+	paidMu    sync.RWMutex
+	paidByUID map[string]bool
 
 	// globalModels 缓存 global 模型目录探测结果（1h TTL + 5min 负缓存；
 	// 探测与合并见 global_models.go）。目录权威 = 桌面端 UA 族，见该文件注释。
@@ -935,7 +948,7 @@ type Client struct {
 	// 空 = 内置默认（对齐官方 5.5.4 分发包）。
 	ClientVersion string
 
-	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.137.1）。
+	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（CN 包内置 CLI 2.176.0 / GL 2.165.0）。
 	CliVersion string
 
 	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
@@ -976,6 +989,11 @@ type Client struct {
 	// modelBusyUnsupported 上游 /v2/chat/busy 在该域不存在（国际版实测 404）。探到一次即置位，
 	// 本进程后续跳过探测（见 modelbusy.go）。atomic：并发调用只读+一次性写。
 	modelBusyUnsupported atomic.Bool
+
+	// ThreeDCredential 混元 3D 的 `ck_t_` 临时云凭证来源（见 three_d_credential.go）。
+	// nil = 拿不到凭证 → 3D 一律回 503，不发请求。启动期挂载；凭证内容不进日志、
+	// 不进错误串、不落盘。
+	ThreeDCredential ThreeDCredential
 }
 
 // CreditObserver 余额查询观察者：每次**真实查到**余额后回调（uid + 余额绝对值）。
@@ -1791,7 +1809,10 @@ type ModelInfo struct {
 	// 「订阅优先」），空=不受限。只透文案不给布尔：海外是 Pro 专属（免费号调不通），
 	// 国内只是「优先调度」（能用，排队靠后），同一个 requiredUserType 两种语义，
 	// 一刀切成「不可用」会把国内这三个模型错标成禁选（issue #235）。
-	Tier              string
+	Tier string
+	// Exclusive accessMode=exclusive：免费号确实调不通（只有这一个字段能这么判，
+	// 文案不能）。选号据此跳过「已知免费」的号，见 pool 的 exclusiveModelOf。
+	Exclusive         bool
 	Vendor            string // vendor 厂商标识
 	IsDefault         bool   // isDefault 是否默认模型
 	SupportsReasoning bool   // supportsReasoning 是否支持推理
@@ -2267,7 +2288,11 @@ type v3ModelTier struct {
 	Enabled  bool     `json:"enabled"`
 	Priority int      `json:"priority"`
 	ModelIDs []string `json:"modelIds"`
-	Badge    *struct {
+	// AccessMode "exclusive" = 免费号根本调不通（海外 Pro Only 的机器可读口径）。
+	// CN 的「订阅优先」没有这个字段，只是排队靠后——把两者混成「不可用」会误拒
+	// 能用的请求（issue #235）。
+	AccessMode string `json:"accessMode"`
+	Badge      *struct {
 		Label string `json:"label"`
 	} `json:"badge"`
 }
@@ -2299,6 +2324,11 @@ func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
 			}
 			best[id] = t.Priority
 			mi.Tier = t.Badge.Label
+			// exclusive 与文案无关：CN 那条「订阅优先」同样带 label 但没有 accessMode，
+			// 落到这里的只有海外 Pro Only 这种真门控。
+			if strings.EqualFold(strings.TrimSpace(t.AccessMode), "exclusive") {
+				mi.Exclusive = true
+			}
 			out[id] = mi
 		}
 	}
@@ -2306,6 +2336,7 @@ func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
 	for _, id := range proOnlyFallback {
 		if mi, ok := out[id]; ok && mi.Tier == "" {
 			mi.Tier = "Pro Only"
+			mi.Exclusive = true // 实测免费号必 11158，与 accessMode=exclusive 同义
 			out[id] = mi
 		}
 	}
@@ -2417,9 +2448,13 @@ func effectiveModelRate(mi ModelInfo) string {
 // 倍率时写入空桶，使旧倍率不会继续冒充当前价。
 func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	rates := make(map[string]string, len(infos))
+	excl := make(map[string]bool)
 	for _, mi := range infos {
 		if mi.ID == "" {
 			continue
+		}
+		if mi.Exclusive {
+			excl[mi.ID] = true
 		}
 		if rate := effectiveModelRate(mi); rate != "" {
 			rates[mi.ID] = rate
@@ -2430,7 +2465,47 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	if c.modelRates == nil {
 		c.modelRates = make(map[string]map[string]string)
 	}
+	if c.exclusive == nil {
+		c.exclusive = make(map[string]map[string]bool)
+	}
 	c.modelRates[realmKey(realm)] = rates
+	c.exclusive[realmKey(realm)] = excl
+}
+
+// ModelExclusive 报告 (域, 模型) 是否「免费号调不通」（modelTiers accessMode=exclusive）。
+// 与 ModelRate 同口径：按 realm 分桶、目录刷新整体替换；未知一律 false（不拦）。
+func (c *Client) ModelExclusive(realm, model string) bool {
+	if c == nil || model == "" {
+		return false
+	}
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	return c.exclusive[realmKey(realm)][model]
+}
+
+// NotePaidUser 记录账号是不是付费号（billing summary 的 IsPaidUser）；只有拿到该字段
+// 时才调用，没调过 = 不知道（选号按「可用」处理，见 pool 的 exclusiveModelOf）。
+func (c *Client) NotePaidUser(uid string, paid bool) {
+	if c == nil || uid == "" {
+		return
+	}
+	c.paidMu.Lock()
+	defer c.paidMu.Unlock()
+	if c.paidByUID == nil {
+		c.paidByUID = make(map[string]bool)
+	}
+	c.paidByUID[uid] = paid
+}
+
+// PaidUser 返回记过的付费状态；第二个返回值为 false 表示没观测过（不是「免费」）。
+func (c *Client) PaidUser(uid string) (paid, known bool) {
+	if c == nil {
+		return false, false
+	}
+	c.paidMu.RLock()
+	defer c.paidMu.RUnlock()
+	paid, known = c.paidByUID[uid]
+	return paid, known
 }
 
 // storeModelMaxOut 按 realm 整体替换模型输出上限快照（maxOutputTokens）。
@@ -2457,6 +2532,16 @@ func (c *Client) storeModelMaxOut(realm string, infos []ModelInfo) {
 		c.modelMaxOut = make(map[string]map[string]int64)
 	}
 	c.modelMaxOut[realmKey(realm)] = m
+}
+
+// StoreModelMaxOutForTest 跨包测试钩子：直接写入某域的模型输出上限快照（真实路径由
+// FetchModels 刷新目录时写入）。仅测试引用。
+func (c *Client) StoreModelMaxOutForTest(realm string, maxOut map[string]int64) {
+	infos := make([]ModelInfo, 0, len(maxOut))
+	for id, n := range maxOut {
+		infos = append(infos, ModelInfo{ID: id, MaxTokens: n})
+	}
+	c.storeModelMaxOut(realm, infos)
 }
 
 // modelMaxOutSnapshot 返回输出上限快照副本；nil 表示未知（不补默认，行为同旧路径）。
@@ -3197,12 +3282,7 @@ func IsAlreadyCheckin(err error) bool {
 	if !errors.As(err, &ue) {
 		return false
 	}
-	for _, m := range alreadyCheckinMarkers {
-		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
-			return true
-		}
-	}
-	return false
+	return isAlreadyCheckinMsg(ue.Msg)
 }
 
 func truncate(s string, n int) string {

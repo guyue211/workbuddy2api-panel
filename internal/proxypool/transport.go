@@ -340,6 +340,7 @@ func (m *Manager) Probe(ctx context.Context, id string) error {
 		return err
 	}
 	version, settings := m.generation[id], m.data.Settings
+	lookupExit := m.exitDueLocked(id, time.Now())
 	m.checking[id] = true
 	delete(m.requested, id)
 	h := m.health[id]
@@ -365,6 +366,15 @@ func (m *Manager) Probe(ctx context.Context, id string) error {
 			message = "health endpoint returned HTTP " + strconv.Itoa(resp.StatusCode)
 		}
 	}
+	// 出口画像顺手刷新（过期才查，见 intel.go）。放在测速之后，且失败不影响健康判定：
+	// 一个查不到归属的代理照样能跑流量。用父 ctx 而不是 checkCtx——探测已经快把
+	// 那个超时用完了。
+	elapsed := time.Since(start)
+	// 出口画像顺手刷新（过期才查，见 intel.go）：还没打开、或这次探测本身就失败，都不查。
+	var intel ExitInfo
+	if lookupExit && message == "" {
+		intel = fetchExitInfo(ctx, tr) // 经该节点自己的 transport：查到的才是这个节点的出口
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.checking, id)
@@ -372,8 +382,9 @@ func (m *Manager) Probe(ctx context.Context, id string) error {
 		m.signal()
 		return nil
 	}
+	m.setExitLocked(id, intel)
 	h = m.health[id]
-	h.checkedAt, h.latencyMS, h.lastError = time.Now(), time.Since(start).Milliseconds(), message
+	h.checkedAt, h.latencyMS, h.lastError = time.Now(), elapsed.Milliseconds(), message
 	if message == "" {
 		h.failures = 0
 		h.successes++
