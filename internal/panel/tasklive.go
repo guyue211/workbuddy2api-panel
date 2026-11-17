@@ -20,6 +20,7 @@
 package panel
 
 import (
+	"context"
 	"net/http"
 	"sync"
 	"time"
@@ -77,6 +78,10 @@ var taskLiveWait = 25 * time.Second
 // 返回 waited=true 表示本次请求等过一轮；refreshing=true 表示返回时仍有一轮在跑
 // （返回的是上一份快照，从没跑完过则为空）。
 func (p *Panel) taskLiveSnapshot(fresh bool) (rows []liveTaskAccount, at time.Time, waited, refreshing bool) {
+	return p.taskLiveSnapshotCtx(context.Background(), fresh)
+}
+
+func (p *Panel) taskLiveSnapshotCtx(ctx context.Context, fresh bool) (rows []liveTaskAccount, at time.Time, waited, refreshing bool) {
 	c := &p.taskLive
 	c.mu.Lock()
 	age := time.Since(c.at)
@@ -100,10 +105,13 @@ func (p *Panel) taskLiveSnapshot(fresh bool) (rows []liveTaskAccount, at time.Ti
 
 	if wait {
 		waited = true
+		timer := time.NewTimer(taskLiveWait)
 		select {
 		case <-done:
-		case <-time.After(taskLiveWait):
+		case <-ctx.Done():
+		case <-timer.C:
 		}
+		timer.Stop()
 	}
 	c.mu.Lock()
 	rows, at, refreshing = c.rows, c.at, c.running != nil
@@ -116,7 +124,7 @@ func (p *Panel) taskLiveSnapshot(fresh bool) (rows []liveTaskAccount, at time.Ti
 // 返回所有启用账号的当前任务表。账号级失败只标在对应行（error 字段），
 // 不影响其它账号——一个号的 token 过期不该让整个看板空掉。
 func (p *Panel) tasksLive(w http.ResponseWriter, r *http.Request) {
-	rows, at, waited, refreshing := p.taskLiveSnapshot(r.URL.Query().Get("fresh") == "1")
+	rows, at, waited, refreshing := p.taskLiveSnapshotCtx(r.Context(), r.URL.Query().Get("fresh") == "1")
 	age := 0
 	if !at.IsZero() {
 		age = int(time.Since(at).Seconds())

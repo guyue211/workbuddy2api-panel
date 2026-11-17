@@ -100,11 +100,21 @@ func (p EffortPolicy) DefaultEffortFor(realm, model string) string {
 		return p.DefaultEffort
 	}
 	model = strings.ToLower(strings.TrimSpace(model))
-	if v, ok := p.ModelDefaults[realmKey(realm)+":"+model]; ok {
+	rk := realmKey(realm)
+	if v, ok := p.ModelDefaults[rk+":"+model]; ok {
 		return v
 	}
 	if v, ok := p.ModelDefaults[model]; ok {
 		return v
+	}
+	// 强制映射付费变体（如 deepseek-v4.1-flash-sg）回落检查原名，使面板里对公开模型名配的默认档同样生效。
+	if base := strings.TrimSuffix(model, "-sg"); base != model && base != "" {
+		if v, ok := p.ModelDefaults[rk+":"+base]; ok {
+			return v
+		}
+		if v, ok := p.ModelDefaults[base]; ok {
+			return v
+		}
 	}
 	return p.DefaultEffort
 }

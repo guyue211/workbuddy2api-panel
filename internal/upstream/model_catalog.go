@@ -202,6 +202,26 @@ func manualCap(model string) (ModelCapEntry, bool) {
 	return e, true
 }
 
+// manualCapMaxOutputs 返回 model.json 里全部 source=manual 且 max_output_tokens>0 的条目快照。
+// 供 storeModelMaxOut 合并：像 deepseek-v4.1-flash-sg 这类隐藏付费变体会被 clientPick 从
+// 公开目录 infos 里滤掉，若只遍历 infos 里的 id，手编上限永远进不了 modelMaxOut。
+func manualCapMaxOutputs() map[string]int64 {
+	c := catalogState
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.initLocked()
+	var out map[string]int64
+	for id, e := range c.entries {
+		if e.Source == manualSource && validCapEntry(e) && e.MaxOutputTokens > 0 {
+			if out == nil {
+				out = make(map[string]int64)
+			}
+			out[id] = e.MaxOutputTokens
+		}
+	}
+	return out
+}
+
 // modelCatalogPut 第 4 级写入：models.dev 拉到的值落缓存（含落盘）。
 func modelCatalogPut(model string, context, maxOutput int64) {
 	modelCatalogPutSourced(model, context, maxOutput, "modelsdev")

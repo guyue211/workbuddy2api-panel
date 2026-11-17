@@ -2524,10 +2524,9 @@ func (c *Client) storeModelMaxOut(realm string, infos []ModelInfo) {
 	}
 	// 手编覆盖（model.json source=manual）与 /v1/models 同口径：声明多少就补多少，
 	// 否则列表写 384k、出站默认仍按上游 128k 补，两边对不上。
-	for id := range m {
-		if e, ok := manualCap(id); ok && e.MaxOutputTokens > 0 {
-			m[id] = e.MaxOutputTokens
-		}
+	// 同时把不在 infos 里的手编条目（如被 clientPick 滤掉的付费变体 -sg）也一并合入。
+	for id, maxTok := range manualCapMaxOutputs() {
+		m[id] = maxTok
 	}
 	c.effortsMu.Lock()
 	defer c.effortsMu.Unlock()

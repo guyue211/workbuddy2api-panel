@@ -959,6 +959,11 @@ func (w *messagesWriter) handleFrame(frame string) error {
 	if w.x.failed || w.x.done {
 		return nil
 	}
+	// 透传 SSE 注释保活帧（": keepalive" / ": heartbeat"），避免长思考或异步换段期间
+	// 客户端/反代因空闲掐线，同时保证 sseCommitWriter 的提交标记与真实响应头下发一致。
+	if strings.HasPrefix(frame, ":") {
+		return w.emitRaw(frame + "\n\n")
+	}
 	if strings.HasPrefix(frame, "data: [DONE]") {
 		return w.closeAndStop()
 	}
@@ -1328,6 +1333,22 @@ func (w *messagesWriter) emit(event string, payload map[string]any) error {
 		w.status = http.StatusOK
 	}
 	if _, err := io.WriteString(w.ResponseWriter, "event: "+event+"\ndata: "+string(raw)+"\n\n"); err != nil {
+		return err
+	}
+	w.Flush()
+	return nil
+}
+
+func (w *messagesWriter) emitRaw(raw string) error {
+	if !w.hdrSent {
+		h := w.Header()
+		h.Set("Content-Type", "text/event-stream")
+		h.Set("Cache-Control", "no-cache")
+		h.Set("Connection", "keep-alive")
+		w.hdrSent = true
+		w.status = http.StatusOK
+	}
+	if _, err := io.WriteString(w.ResponseWriter, raw); err != nil {
 		return err
 	}
 	w.Flush()

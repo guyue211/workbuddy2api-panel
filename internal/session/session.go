@@ -133,6 +133,75 @@ func (r *Router) LoadFromStore() {
 	}
 }
 
+const maxSessionEntries = 16384
+
+// evictIfNeededLocked 限制粘性表最大条目数，防止海量一次性随机键导致内存无界增长。调用方须持写锁。
+func (r *Router) evictIfNeededLocked(now time.Time) {
+	if len(r.entries) < maxSessionEntries {
+		return
+	}
+	for k, v := range r.entries {
+		if expired(v, now, r.cfg.TTL) {
+			delete(r.entries, k)
+		}
+	}
+	if len(r.entries) < maxSessionEntries {
+		return
+	}
+	var oldestKey string
+	var oldestAt time.Time
+	for k, v := range r.entries {
+		if oldestKey == "" || v.lastActive.Before(oldestAt) {
+			oldestKey, oldestAt = k, v.lastActive
+		}
+	}
+	if oldestKey != "" {
+		delete(r.entries, oldestKey)
+	}
+}
+
+// LookupForModel 只查询已有且在该模型上仍可用的粘性绑定，**不在未命中时抢先分配账号**。
+//
+// 为什么聊天主路径需要「只查不抢绑」：ResolveForModel 在新会话未命中时会按简单哈希从可用号里
+// 直接分配，绕过了 Pool.Pick 的完整调度管线（account_priority / account_share / costTier /
+// selection_strategy / reserve_credits / credit_floor）。主路径先调 LookupForModel 复用已有粘性；
+// 未命中或原绑定号已不可用时交回 Pool.PickExcludingForRealm 选号，成功后再调 Bind 落定粘性。
+func (r *Router) LookupForModel(key, model string) (string, bool) {
+	if key == "" {
+		return "", false
+	}
+	now := time.Now()
+	r.mu.RLock()
+	e, found := r.entries[key]
+	r.mu.RUnlock()
+	if !found {
+		return "", false
+	}
+	if expired(e, now, r.cfg.TTL) {
+		r.mu.Lock()
+		if e2, ok := r.entries[key]; ok && expired(e2, now, r.cfg.TTL) {
+			delete(r.entries, key)
+		}
+		r.mu.Unlock()
+		return "", false
+	}
+	available := r.availableSet(model)
+	if available[e.uid] {
+		r.touch(key, e.uid, now)
+		return e.uid, true
+	}
+	// 原绑定号对该模型已不可用（冷却/占满/禁用）→ 清理陈旧绑定，交由 Pool 重新选号。
+	r.mu.Lock()
+	if e2, ok := r.entries[key]; ok && e2.uid == e.uid {
+		delete(r.entries, key)
+		r.mu.Unlock()
+		r.cfg.Store.DelBind(key)
+	} else {
+		r.mu.Unlock()
+	}
+	return "", false
+}
+
 // Resolve 返回会话 key 应绑定的账号 uid，ok=false 表示当前无可用账号。
 // 无模型维度（等价于 ResolveForModel(key, "")），保留给不关心模型的调用方。
 func (r *Router) Resolve(key string) (string, bool) {
@@ -197,11 +266,8 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	}
 	uid := pool2[hashIndex(key, len(pool2))]
 
-	prev, existed := r.entries[key]
+	r.evictIfNeededLocked(now)
 	r.entries[key] = entry{uid: uid, lastActive: now}
-	if existed && prev.uid != uid {
-		r.cfg.Store.DelBind(key)
-	}
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 	return uid, true
 }
@@ -233,6 +299,9 @@ func (r *Router) Bind(key, uid string) {
 	}
 	now := time.Now()
 	r.mu.Lock()
+	if _, exists := r.entries[key]; !exists {
+		r.evictIfNeededLocked(now)
+	}
 	r.entries[key] = entry{uid: uid, lastActive: now}
 	r.mu.Unlock()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)

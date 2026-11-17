@@ -294,4 +294,59 @@ func TestReorderPreservesBody(t *testing.T) {
 	}
 }
 
+// TestHeadOrderConnKeepAliveReuse 同一条连接上连续三轮 HTTP/1.1 Keep-Alive 往返：
+// 每轮响应结束后 c.resp 必须完整复位，后续请求的头块重排与分片 body 写入都不能被上一轮残留状态污染。
+func TestHeadOrderConnKeepAliveReuse(t *testing.T) {
+	c, peer := newTestPipe(t)
+	first, headers := splitFixture(t, "official_v3config_head.txt")
+
+	for round := 1; round <= 3; round++ {
+		reqHead := buildBlock(first, shuffleHeaders(headers))
+		reqBody := []byte(`{"round":1}`)
+		var gotReq []byte
+		donePeer := make(chan struct{})
+		go func() {
+			defer close(donePeer)
+			buf := make([]byte, 4096)
+			for len(gotReq) < len(reqHead)+len(reqBody) {
+				n, err := peer.Read(buf)
+				if n > 0 {
+					gotReq = append(gotReq, buf[:n]...)
+				}
+				if err != nil {
+					break
+				}
+			}
+			// 回一个 Content-Length 响应，模拟真实 keep-alive 复用。
+			_, _ = peer.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+		}()
+
+		// 分两次写：先写头块，再写 body。
+		if _, err := c.Write(reqHead); err != nil {
+			t.Fatalf("round %d write head: %v", round, err)
+		}
+		if _, err := c.Write(reqBody); err != nil {
+			t.Fatalf("round %d write body: %v", round, err)
+		}
+		respBuf := make([]byte, 128)
+		totalRead := 0
+		const wantResp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+		for totalRead < len(wantResp) {
+			n, err := c.Read(respBuf[totalRead:])
+			if err != nil {
+				t.Fatalf("round %d read resp: %v", round, err)
+			}
+			totalRead += n
+		}
+		<-donePeer
+
+		if !strings.HasPrefix(string(gotReq), "GET /v3/config HTTP/1.1\r\nAccept: ") {
+			t.Fatalf("round %d keep-alive 请求头未按官方顺序重排:\n%s", round, gotReq)
+		}
+		if !bytes.HasSuffix(gotReq, reqBody) {
+			t.Fatalf("round %d keep-alive body 丢失: %q", round, gotReq)
+		}
+	}
+}
+
 var _ = io.Discard

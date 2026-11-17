@@ -42,6 +42,7 @@ func (h *Handler) logNoSelectable(realm, model string, modelBlocked bool) {
 	noSelectMu.Unlock()
 
 	total, healthy, cooling, disabled, inFlight := h.cfg.Pool.CountsDetailedForRealm(realm)
-	log.Printf("WARN: [pool] no selectable account realm=%q model=%q pool{total=%d healthy=%d cooling=%d disabled=%d in_flight_full=%d} model_blocked=%v —— 该域本请求快速失败（503）；healthy>0 说明是全被在途/积分保底/模型冷却挡住",
-		realm, model, total, healthy, cooling, disabled, inFlight, modelBlocked)
+	resBlk, floorBlk, modFlt := h.cfg.Pool.NoSelectStats(realm, model)
+	log.Printf("WARN: [pool] no selectable account realm=%q model=%q pool{total=%d healthy=%d cooling=%d disabled=%d in_flight_full=%d reserve_blocked=%d floor_blocked=%d model_filtered=%d} model_blocked=%v —— 该域本请求快速失败（503）",
+		realm, model, total, healthy, cooling, disabled, inFlight, resBlk, floorBlk, modFlt, modelBlocked)
 }

@@ -167,12 +167,13 @@ func (p *Panel) accountProxy(w http.ResponseWriter, r *http.Request) {
 	p.proxyAccountMu.Lock()
 	defer p.proxyAccountMu.Unlock()
 	uid := r.PathValue("uid")
-	if p.cfg.Pool.AuthByUID(uid) == nil {
-		writeErr(w, http.StatusNotFound, "account not found")
-		return
-	}
 	var body proxypool.Binding
 	if !proxyBody(w, r, &body) {
+		return
+	}
+	// 允许对已移出池子的残留账号执行 random 解绑，避免遗留固定绑定导致对应代理永久 409 删不掉。
+	if p.cfg.Pool.AuthByUID(uid) == nil && body.Mode != "random" {
+		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
 	if err := p.cfg.ProxyPool.Bind(uid, body); err != nil {

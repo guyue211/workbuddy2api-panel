@@ -187,13 +187,20 @@ var forcedModelAliases = map[string]string{
 // 强制表命中时，原模型若被 hidden 隐藏或不在 allowed 白名单，则不改写——让后续
 // hidden/allowed 检查按原模型拒绝，避免借目标名绕过黑名单/白名单。
 func (h *Handler) modelAlias(realm, bare string) (string, bool) {
+	target, ok, _ := h.modelAliasWithMeta(realm, bare)
+	return target, ok
+}
+
+// modelAliasWithMeta 同 modelAlias，但额外返回 forced=true 表示命中网关内置强制映射表
+// （此时原模型已通过 hidden/allowed 校验，下游无需再要求隐藏变体如 -sg 也出现在 allowed 白名单里）。
+func (h *Handler) modelAliasWithMeta(realm, bare string) (string, bool, bool) {
 	if bare == "" {
-		return "", false
+		return "", false, false
 	}
 	aliases := h.loadLive().ModelAliases
 	key := strings.ToLower(realm) + ":" + strings.ToLower(bare)
 	if target, ok := aliases[key]; ok {
-		return target, true
+		return target, true, false
 	}
 	// 精确键没中再看通配键（`claude-*` 这类）。map 无序，命中多个时按模式更长优先、
 	// 同长取字典序，保证 `cn:claude-*` 稳定压过 `*`。
@@ -208,16 +215,16 @@ func (h *Handler) modelAlias(realm, bare string) (string, bool) {
 		}
 	}
 	if bestKey != "" {
-		return bestTarget, true
+		return bestTarget, true, false
 	}
 	// 内置强制表：config aliases（精确或通配）都没命中时才生效，运维仍可覆盖。
 	if target, ok := forcedModelAliases[key]; ok {
 		if h.hiddenModel(realm, bare) || !h.allowedModel(realm, bare) {
-			return "", false
+			return "", false, false
 		}
-		return target, true
+		return target, true, true
 	}
-	return "", false
+	return "", false, false
 }
 
 // wildcardMatch 大小写不敏感通配：`*` 任意串（含空）、`?` 单字节。
@@ -530,6 +537,18 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		// model_costs 对照即可判定「某号为何对某模型不出票」。零值也显式写出
 		// （运维口径：缺失会让人误以为没记录）。
 		"credit_floor": h.cfg.Pool.CreditFloor(),
+		"reserve_credits": func() int64 {
+			rc, _ := h.cfg.Pool.ReserveCreditsStatus()
+			return rc
+		}(),
+		"reserve_credits_by_realm": func() map[string]int64 {
+			_, byRealm := h.cfg.Pool.ReserveCreditsStatus()
+			return byRealm
+		}(),
+		"realm_servable": map[string]bool{
+			"cn":     h.cfg.Pool.ServableForRealm("cn"),
+			"global": h.cfg.Pool.ServableForRealm("global"),
+		},
 		// cost_explore 事件与 per-model 时间戳（时间值由 encoding/json 写 RFC3339）。
 		"cost_explore": map[string]any{
 			"events_total": exploreEvents,
@@ -558,7 +577,8 @@ func (h *Handler) capacity(w http.ResponseWriter, r *http.Request) {
 	}
 
 	realm, bareModel := resolveModel(model)
-	if target, ok := h.modelAlias(realm, bareModel); ok && target != "" {
+	target, aliased, forcedAlias := h.modelAliasWithMeta(realm, bareModel)
+	if aliased && target != "" {
 		realm, bareModel = resolveModel(target)
 	}
 	modelAvailable, poolAvailable := h.cfg.Pool.CapacityForModel(bareModel, realm)
@@ -567,8 +587,8 @@ func (h *Handler) capacity(w http.ResponseWriter, r *http.Request) {
 	}
 	// models.allowed 白名单（issue #68）：与 hidden 的归零对称——白名单启用且模型
 	// 不在白名单，这里也必须报零容量。信息面不成为绕过口：客户端按 /v1/capacity
-	// 选模型时，调不通的模型不该显示「有号可用」。
-	if !h.allowedModel(realm, bareModel) {
+	// 选模型时，调不通的模型不该显示「有号可用」。内置强制变体（forcedAlias）已在映射前校验过原模型白名单。
+	if !forcedAlias && !h.allowedModel(realm, bareModel) {
 		modelAvailable = 0
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -927,6 +947,13 @@ func (h *Handler) generationModelEntries() []map[string]any {
 func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "global")
 	if acct == nil {
+		// 保留积分停牌（reserve_credits）仅拦截付费请求，不代表账号死掉且 x0.00 免费档仍可服务；
+		// 与 CN 侧 fetchDynamicModels 对齐，回退 AvailableUIDsForRealm 拉取目录，避免免费档倍率冷启动死锁。
+		if uids := h.cfg.Pool.AvailableUIDsForRealm("global"); len(uids) > 0 {
+			acct = h.cfg.Pool.AuthByUID(uids[0])
+		}
+	}
+	if acct == nil {
 		return nil, nil
 	}
 	return h.cfg.Upstream.FetchGlobalModels(acct), acct
@@ -1077,7 +1104,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// routeModel = 选号/粘性/账本使用的模型名（映射后为真实名，可带 realm 前缀）。
 	modelEcho := ""
 	routeModel := peek.Model
-	if aliasTarget, aliased := h.modelAlias(realm, bareModel); aliased && aliasTarget != "" {
+	origBare := bareModel
+	forcedAlias := false
+	if aliasTarget, aliased, forced := h.modelAliasWithMeta(realm, bareModel); aliased && aliasTarget != "" {
 		var obj map[string]any
 		if json.Unmarshal(body, &obj) == nil {
 			if cur, isStr := obj["model"].(string); isStr && cur == peek.Model {
@@ -1087,6 +1116,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					realm, bareModel = resolveModel(aliasTarget)
 					modelEcho = peek.Model
 					routeModel = aliasTarget
+					forcedAlias = forced
 					log.Printf("INFO: [server] model alias applied: %s -> %s", peek.Model, aliasTarget)
 				}
 			}
@@ -1114,13 +1144,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return ""
 		}
 		// 键查找：先试当前域前缀键（"cn:x"/"global:x"，只在该域生效），再回退裸名键
-		// （两域共用）。配置端原样透传不做归一化（与 models.aliases 不同），带前缀的
-		// 键必须由查找端解析 —— 只查裸名会让前缀键整表失效，而 Config.ModelFallback
-		// 的注释与面板都承诺「裸名或带域前缀均可」（2026-10-25 实案：config.json 写
-		// {"global:deepseek-v4.1-flash": "..."}，global 域 6004 后完全没有降级）。
+		// （两域共用）。若命中内置强制变体（如 -sg）但运维是按公开模型名配的降级，再回退查原模型名。
 		to := m[realm+":"+curModel]
 		if to == "" {
 			to = m[curModel]
+		}
+		if to == "" && forcedAlias && curModel == bareModel && origBare != "" && origBare != curModel {
+			to = m[realm+":"+origBare]
+			if to == "" {
+				to = m[origBare]
+			}
+		}
+		if to != "" && strings.Contains(to, ":") {
+			toRealm, toBare := resolveModel(to)
+			if realm != "" && toRealm != realm {
+				return ""
+			}
+			to = toBare
 		}
 		if to == "" || to == curModel || fallbackTried[to] || !h.allowedModel(realm, to) || h.hiddenModel(realm, to) {
 			return ""
@@ -1183,7 +1223,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 别名解析出的真实目标同样受检，不能绕过白名单（与 hidden 同一条不变量）。
 	// 白名单外一律 400 拒绝，不打上游、不占选号；文案不区分「不存在」与
 	// 「未在白名单」，避免枚举探测。
-	if !h.allowedModel(realm, bareModel) {
+	if !forcedAlias && !h.allowedModel(realm, bareModel) {
 		writeOpenAIErrorHint(w, http.StatusBadRequest, "model_unavailable",
 			"model is not in the gateway allowlist, try another model", "")
 		st.status = http.StatusBadRequest
@@ -1252,11 +1292,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	stickyUID := ""
 	if h.cfg.Session != nil && bindKey != "" {
-		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
-		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		// 用 routeModel 而非 peek.Model（issue #30）：映射后必须按真实模型的
-		// 可用性口径判绑定，别名名不在任何账本里。
-		if uid, ok := h.cfg.Session.ResolveForModel(bindKey, routeModel); ok {
+		// 只查已有且在当前模型可用的粘性绑定：新会话未命中时不抢先哈希选号，
+		// 交由下方 Pool.PickExcludingForRealm 走完整调度管线（优先级/占比/成本分层/保底），
+		// 并在请求真实成功后由 Session.Bind 落定粘性。
+		if uid, ok := h.cfg.Session.LookupForModel(bindKey, routeModel); ok {
 			stickyUID = uid
 		}
 	}
@@ -1328,7 +1367,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		} else if delta.HasPromptTokens || delta.HasCompletionTokens {
 			st.totalTokens = st.promptTokens + st.completionTokens
 		}
-		delta.Model = bareModel
+		delta.Model = curModel
+		if delta.Model == "" {
+			delta.Model = bareModel
+		}
 		if delta.Model == "" {
 			delta.Model = peek.Model
 		}
@@ -1570,7 +1612,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						logfmt.Label(acct.UID, acct.Nickname))
 				} else {
 					lastErr = err
+					if r.Context().Err() != nil {
+						st.outcome = reqlog.OutcomeInterrupted
+						failKeepBinding(acct.UID)
+						break
+					}
 					if proxypool.IsError(err) {
+						fail(acct.UID)
 						break
 					}
 					if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
@@ -1612,15 +1660,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
-			if proxypool.IsError(terr) {
-				break
-			}
-			// 客户端已断连（人走了）例外：传输错误是断连的**结果**，不是这个号的
-			// 错——喂连败会把每次断连都记到当时被选中的号上，几次之后整池逐个被
-			// 降权、且边降边被后续重试刷新，表现为「账号永远解不了封」；换号也只是
-			// 白打上游。真传输抖动（ctx 未取消）照旧计罚。
+			// 客户端已断连（人走了）优先于代理池错误判定：ProxyPool.Do 也会把 context.Canceled
+			// 包进 *proxypool.Error，若先判 proxypool.IsError 会把正常的客户端断开记成 503 proxy_unavailable。
 			if r.Context().Err() != nil {
 				st.outcome = reqlog.OutcomeInterrupted
+				failKeepBinding(acct.UID)
+				break
+			}
+			if proxypool.IsError(terr) {
 				fail(acct.UID)
 				break
 			}
@@ -1867,14 +1914,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				case upstream.ErrEmptyContent:
 					code, fallback = "empty_content", "a message in the request history has empty content"
 				}
-				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-				fail(acct.UID)
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), curModel, uerr)
+				failKeepBinding(acct.UID)
 				msg := string(respBody)
 				if strings.TrimSpace(msg) == "" {
 					msg = fallback
 				}
 				writeOpenAIErrorHint(w, http.StatusBadRequest, code, msg,
-					h.hintOf(kind, string(respBody), bareModel, reqHasImage, uerr))
+					h.hintOf(kind, string(respBody), curModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
 				return
@@ -1882,7 +1929,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
-			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+			h.applyErrorPolicy(acct.UID, kind, string(respBody), curModel, uerr)
 			fail(acct.UID)
 			// 11140 风控连坐（restrict.go）：上游判的是设备/出口而不是单个账号，换号等于
 			// 把下一个号也送进去 → 就地停手，并把这次限制喂给所属域的暂停判定。
@@ -1901,19 +1948,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		h.cfg.Pool.NoteSuccess(acct.UID)
-		// 成功才带头。uid 是十六进制，昵称可能非 ASCII，不入头。
-		w.Header().Set("X-Wb-Account", acct.UID)
-		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
-		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
-		h.cfg.Pool.BlockModelClear(acct.UID, curModel)
-		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
-		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if bindKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(bindKey, acct.UID)
-		}
 		if peek.Stream {
-			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
+			// 流式：透传前先挂 X-Wb-Account 头（StreamHint 首帧落盘即隐式提交响应头）；
+			// 若触发首帧否决（零字节写出），擦除该头并继续轮转，NoteSuccess/BlockModelClear/Session.Bind
+			// 延后到越过首帧否决之后再执行，防止 HTTP 200 + 首帧 error 先把连败/软冷却计数清零。
+			w.Header().Set("X-Wb-Account", acct.UID)
 			st.status = http.StatusOK
 			// 截断自动续写（见 continue.go）：上游 finish_reason=length 且为纯文本/推理
 			// 段时，同账号同模型补发「已输出内容+续写指令」，多段拼成一条客户端可见流。
@@ -1933,7 +1972,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 实测最常见的泄漏成因，只做严格判定等于对主场景不设防。
 			repair := upstream.NewMarkupRepair(declaredTools, true)
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
-				return h.hintContext(bareModel, reqHasImage)
+				return h.hintContext(curModel, reqHasImage)
 			}), upstream.WithMarkupRepair(repair), upstream.WithModelEcho(modelEcho),
 				// 客户端已断开时上游只是被动跟随，别把断流记成上游故障（日志归因）。
 				upstream.WithClientGoneFn(func() bool { return r.Context().Err() != nil }),
@@ -1943,6 +1982,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 透给客户端（SSE 发过字节就改不了状态码，此前只能这么兜底）。
 			var hv *upstream.HeadVetoError
 			if errors.As(sErr, &hv) {
+				w.Header().Del("X-Wb-Account")
 				// 客户端一个字节没收到，但续写层在首帧之前可能已经跑完过一段（零输出的首段
 				// 触发了救援重发、救援段才吐出 error 帧）：那一段已经计费，照实记账。
 				bd, bc, _, bhc := billedDelta(cont.billedUsage())
@@ -1955,14 +1995,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				if hv.Payload == "" {
 					// 零有效帧：上游缺陷，不是账号的问题（不罚号），但换号值得一试。
 					lastErr = sErr
-					log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (no byte written, rotating)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
+					log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (no byte written, rotating)", logfmt.Label(acct.UID, acct.Nickname), curModel)
 				} else {
 					// 帧内错误没有独立 HTTP 状态：末端映射只看 Kind，Status 仅作信封占位。
 					kind := upstream.FrameKind(hv.Payload)
-					h.applyErrorPolicy(acct.UID, kind, hv.Payload, bareModel, nil)
+					h.applyErrorPolicy(acct.UID, kind, hv.Payload, curModel, nil)
 					lastErr = &upstream.Error{Kind: kind, Msg: hv.Payload}
 					log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame before first byte kind=%s payload=%s (rotating)",
-						logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(hv.Payload, 200))
+						logfmt.Label(acct.UID, acct.Nickname), curModel, kind, logfmt.Truncate(hv.Payload, 200))
 					// 11140 风控限制与 HTTP 路径同口径：就地停手，不把下一个号也送进去。
 					if h.noteRestriction(acct, kind, hv.Payload) {
 						break
@@ -1972,6 +2012,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					break // ctx 取消：终止轮转（首帧否决换号退避）
 				}
 				continue
+			}
+			if !upstream.IsEmptyStreamError(sErr) && !stats.SawErrorFrame() {
+				h.cfg.Pool.NoteSuccess(acct.UID)
+				h.cfg.Pool.BlockModelClear(acct.UID, curModel)
+				if bindKey != "" && h.cfg.Session != nil {
+					h.cfg.Session.Bind(bindKey, acct.UID)
+				}
 			}
 			switch {
 			case upstream.IsEmptyStreamError(sErr):
@@ -2069,7 +2116,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 供下次选号把免费/便宜的号排在前面。
 			if hasCredit {
 				st.credit, st.hasCredit = credit, true
-				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+				h.cfg.Pool.NoteModelCost(acct.UID, curModel, credit, total)
 			}
 			rc.Close()
 			return
@@ -2087,7 +2134,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 文案保留 err 原文（含 "context canceled"），错误汇总按「客户端中断/info」归类。
 			if cerr := r.Context().Err(); cerr != nil {
 				log.Printf("WARN: [server] sync acct=%s model=%s: 调用方断开（%v），上游输出已丢弃（CDN 回源超时常见于 EdgeOne 默认 15s）",
-					logfmt.Label(acct.UID, acct.Nickname), bareModel, cerr)
+					logfmt.Label(acct.UID, acct.Nickname), curModel, cerr)
 				st.status = 499
 				st.outcome = reqlog.OutcomeInterrupted
 				return
@@ -2095,11 +2142,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			// 与流式空流那条 WARN 对称——此前这条只写响应不落日志，运维侧只能看到
 			// 一行 sync 502，无从判断是上游空体还是别的（同一失败在流式路径有 WARN）。
-			log.Printf("WARN: [server] sync acct=%s model=%s: upstream parse failed: %v", logfmt.Label(acct.UID, acct.Nickname), bareModel, err)
+			log.Printf("WARN: [server] sync acct=%s model=%s: upstream parse failed: %v", logfmt.Label(acct.UID, acct.Nickname), curModel, err)
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			st.outcome = reqlog.OutcomeHTTPError
 			return
+		}
+		h.cfg.Pool.NoteSuccess(acct.UID)
+		w.Header().Set("X-Wb-Account", acct.UID)
+		h.cfg.Pool.BlockModelClear(acct.UID, curModel)
+		if bindKey != "" && h.cfg.Session != nil {
+			h.cfg.Session.Bind(bindKey, acct.UID)
 		}
 		// 空截断救援（见 starved.go）：额度被思考吃光、正文零字节。非流式这一侧
 		// 没有 continueReader，救援在这里做——同预算关思考重发一次、重新聚合。
@@ -2174,7 +2227,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if hasCredit {
 			st.credit, st.hasCredit = credit, true
-			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			h.cfg.Pool.NoteModelCost(acct.UID, curModel, credit, total)
 		}
 		return
 	}
@@ -2773,6 +2826,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 				"网关 401 × %d 且 refresh 验证失败（token 已确认失效）", pool.SessionDeadThreshold())) {
 				log.Printf("WARN: [server] 账号 %s 连续 %d 次网关 401 且 refresh 失败（token 确实失效）→ 禁用，需重新登录",
 					logfmt.Label(uid, ""), pool.SessionDeadThreshold())
+			} else {
+				// 尚未达阈（第 1~2 次）：给短退避冷却，防止毫秒级并发请求在同一瞬间把 3 次机会一次性烧穿。
+				h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "gateway 401 (session dead strike)")
 			}
 			return
 		}

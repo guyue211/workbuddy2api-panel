@@ -155,6 +155,18 @@ func (h *Handler) hostedProbe(ctx context.Context, obj map[string]any, msgs []an
 	// realm 前缀是网关侧路由协议：出站与选号一律用裸模型名（与 chat 路径同一口径，
 	// 否则上游对带前缀的名字回 11102「model ... service info not found」）。
 	realm, bare = resolveModel(asString(obj["model"]))
+	target, aliased, forced := h.modelAliasWithMeta(realm, bare)
+	if aliased && target != "" {
+		realm, bare = resolveModel(target)
+	}
+	if (!forced && !h.allowedModel(realm, bare)) || h.hiddenModel(realm, bare) {
+		return nil, nil, realm, bare, fmt.Errorf("model unavailable: %s", bare)
+	}
+	if admitted, _ := ctx.Value(budgetAdmittedKey{}).(bool); !admitted {
+		if ok, _ := h.budget.admit(); !ok {
+			return nil, nil, realm, bare, fmt.Errorf("credit budget exhausted")
+		}
+	}
 	if realm != "global" {
 		realm = "cn"
 	}

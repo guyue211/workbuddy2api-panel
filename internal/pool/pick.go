@@ -188,18 +188,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	// 截断会让 uid 靠后的账号永远进不了 top5（等权重账号被字典序饿死、LRU 兜底
 	// 又只在 top5 内转——惊群集中单号的根因）。洗牌用独立的 time-seeded 源，
 	// 只在截断边界制造等权重随机次序，不影响加权抽签本身的确定性。
-	if len(ws) > 5 {
-		eq := false
-		for i := 1; i < len(ws); i++ {
-			if ws[i].w == ws[0].w {
-				eq = true
-				break
-			}
-		}
-		if eq {
-			shuf := rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(len(ws))))
-			shuf.Shuffle(len(ws), func(i, j int) { ws[i], ws[j] = ws[j], ws[i] })
-		}
+	shuffled := false
+	if p.randInt64N == nil && len(ws) > 5 {
+		shuf := rand.New(rand.NewPCG(uint64(now.UnixNano())^uint64(p.pickSeq), uint64(len(ws))))
+		shuf.Shuffle(len(ws), func(i, j int) { ws[i], ws[j] = ws[j], ws[i] })
+		shuffled = true
 	}
 	sort.SliceStable(ws, func(i, j int) bool {
 		// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
@@ -210,7 +203,10 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if ws[i].w != ws[j].w {
 			return ws[i].w > ws[j].w
 		}
-		return ws[i].e.a.UID < ws[j].e.a.UID // 稳定兜底（洗牌后此项几乎不触发）
+		if shuffled {
+			return false // 保留洗牌随机序，避免 UID 字典序将洗牌完全撤销导致尾部账号饿死
+		}
+		return ws[i].e.a.UID < ws[j].e.a.UID // 确定性测试源或小池稳定兜底
 	})
 	cands = cands[:0]
 	for _, c := range ws {
@@ -312,6 +308,9 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 	if p.creditFloor <= 0 || model == "" || e.exactCredits() >= float64(p.creditFloor) {
 		return false
 	}
+	if realm == "" && e.a != nil {
+		realm = e.a.Realm()
+	}
 	// 1) 本地实测台账：最权威（真实扣费证据）。
 	if mc, ok := e.modelCostOf(model, now); ok {
 		return mc.CostPer1k > 0
@@ -378,8 +377,11 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		if e.disabled || e.paused {
 			continue // 禁用/暂停选号的账号永不参与兜底
 		}
-		if e.modelCooled(now, model) {
-			continue // 兜底也不能绕过模型冷却或手动模型停牌。
+		if e.modelOffed(model) || e.blockedByRules(model) || e.modelCooled(now, model) {
+			continue // 兜底也不能绕过手动停牌、模型黑白名单规则或模型冷却。
+		}
+		if p.exclusiveBlockedForRealmModel(e, model, realm) {
+			continue // 已知免费号调不通的专属模型不进兜底
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402

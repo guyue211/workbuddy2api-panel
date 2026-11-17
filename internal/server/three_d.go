@@ -16,6 +16,7 @@ import (
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 	"github.com/misakano7545/workbuddy2api-panel/internal/usage"
 )
@@ -297,7 +298,13 @@ func (h *Handler) threeDGenerations(w http.ResponseWriter, r *http.Request) {
 			if errors.As(err, &ue) {
 				h.applyErrorPolicy(a.UID, ue.Kind, ue.Msg, "hy-3d", ue)
 				if requestLevelFailFastKind(ue.Kind) {
-					writeOpenAIError(w, ue.Status, "upstream_error", ue.Msg)
+					status := ue.Status
+					if status < 400 {
+						status = http.StatusBadGateway
+					}
+					st.status = status
+					st.outcome = reqlog.OutcomeHTTPError
+					writeOpenAIError(w, status, "upstream_error", ue.Msg)
 					return
 				}
 			}

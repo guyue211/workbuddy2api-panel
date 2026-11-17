@@ -1,6 +1,10 @@
 package proxypool
 
-import "testing"
+import (
+	"encoding/json"
+	"sync"
+	"testing"
+)
 
 // TestRealmDefaultExit realm 级默认出口（issue #39 P3）：账号没有显式绑定时按
 // realm 取默认出口；账号级绑定一律优先——「未指定的账号才走 realm 默认」是这条
@@ -98,4 +102,30 @@ func TestBindRealmRejectsBadInput(t *testing.T) {
 			t.Errorf("realm %q 应被拒绝", realm)
 		}
 	}
+}
+
+func TestBindRealmSnapshotConcurrentSafe(t *testing.T) {
+	m := testManager(t, "")
+	id := addProxy(t, m, "http://127.0.0.1:1080")
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			if i%2 == 0 {
+				_ = m.BindRealm("global", Binding{Mode: "fixed", ProxyID: id})
+			} else {
+				_ = m.BindRealm("cn", Binding{Mode: "direct"})
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			snap := m.Snapshot()
+			_, _ = json.Marshal(snap)
+		}
+	}()
+	wg.Wait()
 }

@@ -217,6 +217,17 @@ func New(path string, base *http.Transport, dialer *net.Dialer) (*Manager, error
 			return nil, err
 		}
 	}
+	if m.data.Realms == nil {
+		m.data.Realms = map[string]Binding{}
+	}
+	for rk, b := range m.data.Realms {
+		if realmKey(rk) == "" {
+			return nil, errors.New("invalid realm in stored proxy pool")
+		}
+		if err := m.validateBindingLocked(b); err != nil {
+			return nil, err
+		}
+	}
 	return m, nil
 }
 
@@ -258,6 +269,10 @@ func (m *Manager) copyLocked() disk {
 	for k, v := range m.data.Bindings {
 		d.Bindings[k] = v
 	}
+	d.Realms = make(map[string]Binding, len(m.data.Realms))
+	for k, v := range m.data.Realms {
+		d.Realms[k] = v
+	}
 	return d
 }
 
@@ -296,6 +311,11 @@ func (m *Manager) Snapshot() Snapshot {
 	s := Snapshot{Proxies: []View{}, Bindings: d.Bindings, Realms: d.Realms, Health: d.Settings}
 	counts := map[string]int{}
 	for _, b := range d.Bindings {
+		if b.Mode == "fixed" {
+			counts[b.ProxyID]++
+		}
+	}
+	for _, b := range d.Realms {
 		if b.Mode == "fixed" {
 			counts[b.ProxyID]++
 		}

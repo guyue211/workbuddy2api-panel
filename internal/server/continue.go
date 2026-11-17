@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -607,7 +608,9 @@ func (r *continueReader) pollPending() bool {
 		if res.rc != nil {
 			res.rc.Close()
 		}
-		ps.onFail(res.status, res.err)
+		if !r.clientGone() && !errors.Is(res.err, context.Canceled) {
+			ps.onFail(res.status, res.err)
+		}
 		r.decideNext(ps.sawDone, ps.next)
 		return true
 	case <-time.After(wait):
@@ -865,12 +868,15 @@ func (r *continueReader) limitedButContinuable() bool {
 // canContinue 续写资格判定（sawDone=false 表示 EOF/读错误收尾——只有显式
 // finish_reason=length 才续，读错误不续，避免把故障流当截断流续错）。
 func (r *continueReader) canContinue(sawDone bool) bool {
+	if !r.cutNoFinish(sawDone) && r.finish != "length" {
+		return false
+	}
 	switch {
 	case r.atSegmentCap():
 		return false
 	case r.outputCapped():
-		// 累计输出到顶：再续就是无节制地烧配额了。标出来，让终态归因能区分
-		// 「撞网关自己的上限」与「上游断流」。
+		// 累计输出到顶：再续就是无节制地烧配额了。只在确实需要续写（length 或断流）时置位，
+		// 避免正常 finish=stop 收尾被误打「按截断收尾」日志。
 		r.continueCapped = true
 		return false
 	case r.clientGone():
@@ -894,8 +900,6 @@ func (r *continueReader) canContinue(sawDone bool) bool {
 		// 含工具分片同样不给（与下面 length 分支同一条理由）：残缺 tool_calls 不进
 		// 重试前缀，模型会重发一遍，客户端在同一块里拼两次参数 → 半截 JSON 变垃圾。
 		return (r.seg > 0 || r.text.Len() > 0 || r.reason.Len() > 0) && !r.toolSeen && !r.blindRetried
-	case r.finish != "length":
-		return false
 	case r.toolSeen:
 		log.Printf("[continue] 跳过：本段含工具调用分片（参数可能残缺，拼接风险高）")
 		return false

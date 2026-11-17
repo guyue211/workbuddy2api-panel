@@ -156,7 +156,7 @@ func (r *continueReader) emptiedByThinking() bool {
 
 func (r *continueReader) tryStarvedRetry() bool {
 	switch {
-	case r.starvedTried, r.errSeen, r.toolSeen:
+	case r.starvedTried, r.errSeen, r.toolSeen, r.clientGone():
 		return false
 	case r.finish != "length" && !r.emptiedByThinking():
 		// length = 额度用尽；emptiedByThinking = 上游思考完直接 stop（正文 0B）。

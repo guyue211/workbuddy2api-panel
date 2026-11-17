@@ -78,6 +78,9 @@ func (c *headOrderConn) Write(p []byte) (int, error) {
 		rest := c.pending[i+4:]
 		c.pending = nil
 		c.phase = phaseInBody
+		c.respMu.Lock()
+		c.resp = respTracker{}
+		c.respMu.Unlock()
 
 		out := reorderHeadBlock(head)
 		if _, err := c.Conn.Write(out); err != nil {
@@ -98,6 +101,9 @@ func (c *headOrderConn) Read(p []byte) (int, error) {
 	if n > 0 {
 		c.respMu.Lock()
 		done := c.resp.feed(p[:n])
+		if done {
+			c.resp = respTracker{}
+		}
 		c.respMu.Unlock()
 		if done {
 			c.mu.Lock()

@@ -72,8 +72,16 @@ func MinOutputBudget(effort string) int64 {
 //   - 目录值更小时以目录为准——不把额度抬到模型物理上写不了的值。
 func outputFloor(effort, model string, maxOut map[string]int64) int64 {
 	floor := MinOutputBudget(effort)
+	if floor <= 0 {
+		return 0
+	}
 	c, ok := maxOut[model]
-	if floor <= 0 || !ok || c <= 0 {
+	if (!ok || c <= 0) && model != "" {
+		if e, mok := manualCap(model); mok && e.MaxOutputTokens > 0 {
+			c, ok = e.MaxOutputTokens, true
+		}
+	}
+	if !ok || c <= 0 {
 		return 0
 	}
 	return min(floor, c)

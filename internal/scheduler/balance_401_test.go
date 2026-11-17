@@ -16,11 +16,12 @@ import (
 
 // healFake 假上游：余额端点恒 401；refresh 端点按 account 返回 12153 或新 token。
 type healFake struct {
-	mu         sync.Mutex
-	refresh    int    // refresh 被调用次数
-	probe      int    // 余额探测次数
-	sessionDie bool   // refresh 是否回 12153
-	dieMsg     string // 12153 的文案（默认英文原文；另有本地化变体用例）
+	mu          sync.Mutex
+	refresh     int    // refresh 被调用次数
+	probe       int    // 余额探测次数
+	sessionDie  bool   // refresh 是否回 12153
+	dieMsg      string // 12153 的文案（默认英文原文；另有本地化变体用例）
+	refreshHTML bool   // refresh 自身也被 APISIX HTML 401 拦（边缘抖动，无业务信封）
 }
 
 func (f *healFake) server(t *testing.T) *httptest.Server {
@@ -30,6 +31,12 @@ func (f *healFake) server(t *testing.T) *httptest.Server {
 		defer f.mu.Unlock()
 		if strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
 			f.refresh++
+			if f.refreshHTML {
+				w.Header().Set("Content-Type", "text/html")
+				w.WriteHeader(http.StatusUnauthorized)
+				fmt.Fprint(w, "<html><head><title>401 Authorization Required</title></head><body>openresty</body></html>")
+				return
+			}
 			if f.sessionDie {
 				msg := f.dieMsg
 				if msg == "" {
@@ -164,5 +171,53 @@ func TestBalanceProbe401SessionDeadLocalizedMessage(t *testing.T) {
 	s.RunBalanceRefreshNow()
 	if st, _ := s.cfg.Pool.Status("u1"); st.SessionDeadFails != 1 {
 		t.Fatalf("本地化 12153 文案也必须判死，session dead 计数=%d want 1", st.SessionDeadFails)
+	}
+}
+
+// 真实线上形态（45 实测）：会话被上游注销时本地 ExpiresAt 仍余数月（登录时写 ~365 天）。
+// 因为 AT 刚被 /v2/billing 拒为 401 且 refresh 明确 12153 判死，必须照常计入 session dead
+// 并在连续达到阈值后禁用，绝不能被本地未到期的 ExpiresAt 挡在门外永不禁用。
+func TestBalanceProbe401SessionDeadEvenWhenLocalExpiryInFuture(t *testing.T) {
+	f := &healFake{sessionDie: true}
+	srv := f.server(t)
+	a := &auth.Auth{
+		UID:          "u-revoked",
+		AccessToken:  "at-revoked",
+		RefreshToken: "rt-revoked",
+		ExpiresAt:    time.Now().Add(300 * 24 * time.Hour).Unix(),
+	}
+	s := healScheduler(t, srv.URL, a)
+
+	for i := 1; i <= pool.SessionDeadThreshold(); i++ {
+		s.RunBalanceRefreshNow()
+		st, _ := s.cfg.Pool.Status("u-revoked")
+		if i < pool.SessionDeadThreshold() {
+			if st.SessionDeadFails != i || st.Disabled {
+				t.Fatalf("round %d: got fails=%d disabled=%v", i, st.SessionDeadFails, st.Disabled)
+			}
+		} else if !st.Disabled {
+			t.Fatalf("round %d: expected revoked account to be disabled, got %+v", i, st)
+		}
+	}
+}
+
+// 边缘抖动防护：若 refresh 端点自身也返回无业务信封的 APISIX HTML 401，属于 VerifyInconclusive，不计死。
+func TestBalanceProbe401RefreshGatewayHTMLIsInconclusive(t *testing.T) {
+	f := &healFake{refreshHTML: true}
+	srv := f.server(t)
+	a := &auth.Auth{
+		UID:          "u-edge",
+		AccessToken:  "at-1",
+		RefreshToken: "rt-1",
+		ExpiresAt:    time.Now().Add(30 * 24 * time.Hour).Unix(),
+	}
+	s := healScheduler(t, srv.URL, a)
+
+	for range 4 {
+		s.RunBalanceRefreshNow()
+	}
+	st, _ := s.cfg.Pool.Status("u-edge")
+	if st.SessionDeadFails != 0 || st.Disabled {
+		t.Fatalf("APISIX HTML 401 on refresh must not count as session dead: %+v", st)
 	}
 }

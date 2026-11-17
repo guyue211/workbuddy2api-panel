@@ -55,7 +55,11 @@ func (h *Handler) chatBusy(w http.ResponseWriter, r *http.Request) {
 		realm, bare := resolveModel(m)
 		lvl := busyLevelUnknown
 		if _, ok := known[bare]; ok {
-			if h.cfg.Pool != nil && h.cfg.Pool.ModelBlockedForRealm(bare, realm).Blocked {
+			checkRealm, checkBare := realm, bare
+			if target, aliased := h.modelAlias(realm, bare); aliased && target != "" {
+				checkRealm, checkBare = resolveModel(target)
+			}
+			if h.cfg.Pool != nil && h.cfg.Pool.ModelBlockedForRealm(checkBare, checkRealm).Blocked {
 				lvl = busyLevelBusy
 			} else {
 				lvl = busyLevelIdle

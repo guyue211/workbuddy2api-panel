@@ -534,8 +534,8 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
 	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
 	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
-		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
-			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
+		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%.2f < floor=%d, unbind (paid model held out)",
+			logfmt.Label(e.a.UID, e.a.Nickname), model, e.exactCredits(), p.creditFloor)
 		return nil
 	}
 	e.lastUsed = now
@@ -820,11 +820,39 @@ func (p *Pool) SlotWaitForRealm(model, realm string) bool {
 		if !e.healthyForModel(now, model) {
 			continue
 		}
+		if p.floorBlockedForRealmModel(e, model, realm, now) || p.exclusiveBlockedForRealmModel(e, model, realm) {
+			continue
+		}
 		if p.inFlightFull(e) && !p.reserveBlocked(e, p.modelFreeOf(e, model)) {
 			return true
 		}
 	}
 	return false
+}
+
+// NoSelectStats 统计该域健康账号中因保留积分、积分保底、模型冷却/停牌而被挡住的数量（供排障日志与监控使用）。
+func (p *Pool) NoSelectStats(realm, model string) (reserveBlocked, floorBlocked, modelFiltered int) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if e.disabled || e.paused || !e.healthy(now) {
+			continue
+		}
+		if p.reserveBlocked(e, p.modelFreeOf(e, model)) {
+			reserveBlocked++
+		}
+		if p.floorBlockedForRealmModel(e, model, realm, now) {
+			floorBlocked++
+		}
+		if model != "" && !e.healthyForModel(now, model) {
+			modelFiltered++
+		}
+	}
+	return reserveBlocked, floorBlocked, modelFiltered
 }
 
 // List 返回所有账号状态（按 UID 排序，稳定输出）。

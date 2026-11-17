@@ -887,3 +887,18 @@ func TestNormalizeToolParameters11129(t *testing.T) {
 		}
 	})
 }
+
+func TestTranslateMaxOutputTokensPreservesClientCap(t *testing.T) {
+	obj := map[string]any{
+		"model":             "deepseek-v4.1-flash",
+		"max_output_tokens": float64(4096),
+	}
+	translateMaxCompletionTokens(obj)
+	injectCatalogMaxTokens(obj, map[string]int64{"deepseek-v4.1-flash": 384000})
+	if _, leaked := obj["max_output_tokens"]; leaked {
+		t.Fatal("max_output_tokens should be stripped after translation")
+	}
+	if got, _ := obj["max_tokens"].(int64); got != 4096 {
+		t.Fatalf("max_tokens = %v, want 4096 (client max_output_tokens must not be overwritten by catalog 384000)", obj["max_tokens"])
+	}
+}

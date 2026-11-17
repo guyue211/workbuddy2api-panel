@@ -51,3 +51,35 @@ func TestModelCatalogPutKeepsManual(t *testing.T) {
 		t.Fatalf("manual entry overwritten: max output = %d (ok=%v), want 384000", got, ok)
 	}
 }
+
+// 隐藏付费变体（如 deepseek-v4.1-flash-sg 被 clientPick 从公开目录滤掉）以及冷启动尚未拉取目录时，
+// manual 条目仍须对 injectCatalogMaxTokens 与 OutputBudgetFloor 生效。
+func TestManualCapAppliesToHiddenVariantAndColdStart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model.json")
+	if err := os.WriteFile(path, []byte(`{
+		"deepseek-v4.1-flash-sg": {"context_length": 1000000, "max_output_tokens": 384000, "source": "manual"}
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetModelCatalog()
+	t.Cleanup(resetModelCatalog)
+	loadModelCatalogAt(path)
+
+	// 1. 冷启动（maxOut 为 nil）下 injectCatalogMaxTokens 与 outputFloor 都能命中手编值。
+	obj := map[string]any{"model": "deepseek-v4.1-flash-sg"}
+	injectCatalogMaxTokens(obj, nil)
+	if got, _ := obj["max_tokens"].(int64); got != 384000 {
+		t.Fatalf("cold-start injectCatalogMaxTokens = %v, want 384000", obj["max_tokens"])
+	}
+	if floor := outputFloor("max", "deepseek-v4.1-flash-sg", nil); floor != 16384 {
+		t.Fatalf("cold-start outputFloor = %d, want 16384", floor)
+	}
+
+	// 2. storeModelMaxOut 收到不含 -sg 的公开目录 infos 后，modelMaxOut 快照仍包含 -sg=384000。
+	c := New()
+	c.storeModelMaxOut("global", []ModelInfo{{ID: "deepseek-v4.1-flash", MaxTokens: 128000}})
+	if floor := c.OutputBudgetFloor("global", "deepseek-v4.1-flash-sg", "high"); floor != 8192 {
+		t.Fatalf("OutputBudgetFloor for -sg = %d, want 8192", floor)
+	}
+}

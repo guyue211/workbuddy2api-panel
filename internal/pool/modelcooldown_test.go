@@ -618,3 +618,44 @@ func TestCooldownModelBusyKeepsLaterCooldown(t *testing.T) {
 		t.Errorf("繁忙窗口把已有冷却从 50m 缩短到了 %v", d)
 	}
 }
+
+// TestModelBusyBackoffSurvivesLazyCleanup 生产实景：窗口到期后先经一次 Pick 触发
+// pruneExpiredModelCooldowns 删除 modelCooldowns 条目，随后请求再次命中 14003 时
+// 阶梯必须从 10s 升到 20s，而不是永远停在首档 10s；成功后清零。
+func TestModelBusyBackoffSurvivesLazyCleanup(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+
+	p.CooldownModelBusy("u1", "glm-5.2", "14003 model busy")
+	p.mu.Lock()
+	mc := p.byUID["u1"].modelCooldowns["glm-5.2"]
+	mc.Until = time.Now().Add(-time.Millisecond)
+	p.byUID["u1"].modelCooldowns["glm-5.2"] = mc
+	p.mu.Unlock()
+
+	// Pick 会调用 pruneExpiredModelCooldowns 删除过期冷却条目。
+	if got := p.PickExcludingForModel(nil, "glm-5.2"); got == nil || got.UID != "u1" {
+		t.Fatalf("expired busy cooldown should allow u1, got %+v", got)
+	}
+
+	// 半开探测再次 14003 → 退避时长应翻倍到 ~20s（> 15s）。
+	p.CooldownModelBusy("u1", "glm-5.2", "14003 model busy")
+	st, _ := p.Status("u1")
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("rate_limited_models=%+v", st.RateLimitedModels)
+	}
+	if d := time.Until(st.RateLimitedModels[0].Until); d < 15*time.Second || d > 23*time.Second {
+		t.Fatalf("second strike after pick cleanup should escalate to ~20s, got %v", d)
+	}
+
+	// 模型请求成功后清零命中记忆。
+	p.BlockModelClear("u1", "glm-5.2")
+	p.mu.Lock()
+	delete(p.byUID["u1"].modelCooldowns, "glm-5.2")
+	p.mu.Unlock()
+	p.CooldownModelBusy("u1", "glm-5.2", "14003 model busy")
+	stAfterClear, _ := p.Status("u1")
+	if d := time.Until(stAfterClear.RateLimitedModels[0].Until); d > modelBusyBase+2*time.Second {
+		t.Fatalf("after BlockModelClear, busy backoff should reset to ~10s, got %v", d)
+	}
+}

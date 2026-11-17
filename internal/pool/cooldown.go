@@ -283,7 +283,7 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			if e.modelCooldowns == nil {
 				e.modelCooldowns = map[string]modelCooldown{}
 			}
-			hits := e.modelCooldowns[model].Hits + 1
+			hits := e.nextModelHit(model, hitSoftRate, now)
 			e.modelCooldowns[model] = modelCooldown{
 				Until:  now.Add(p.softDurationLocked(base, hits)),
 				Reason: reason,
@@ -330,7 +330,7 @@ func (p *Pool) CooldownModelBusy(uid, model, reason string) {
 	if e.modelCooldowns == nil {
 		e.modelCooldowns = map[string]modelCooldown{}
 	}
-	hits := e.modelCooldowns[model].Hits + 1
+	hits := e.nextModelHit(model, hitModelBusy, now)
 	d := modelBusyBase
 	for i := 1; i < hits && d < modelBusyMax; i++ {
 		d *= 2
@@ -357,6 +357,7 @@ func clearRoutingModelCooldownsLocked(e *entry) {
 	if len(e.modelCooldowns) == 0 {
 		e.modelCooldowns = nil
 	}
+	e.modelHits = nil
 }
 
 // modelBlock TTL 常量（11102 负缓存退避）：
@@ -394,11 +395,7 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 		return
 	}
 	now := time.Now()
-	hits := 0
-	if e.modelCooldowns != nil {
-		hits = e.modelCooldowns[model].Hits
-	}
-	hits++
+	hits := e.nextModelHit(model, hitModelBlock, now)
 	ttl := modelBlockBaseTTL
 	if d := ttl * (1 << uint(min(hits-1, modelBlockShift))); d < modelBlockMaxTTL {
 		ttl = d
@@ -426,7 +423,13 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
-	if !ok || len(e.modelCooldowns) == 0 {
+	if !ok {
+		return
+	}
+	if len(e.modelHits) > 0 {
+		delete(e.modelHits, model)
+	}
+	if len(e.modelCooldowns) == 0 {
 		return
 	}
 	mc, exists := e.modelCooldowns[model]

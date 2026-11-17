@@ -310,6 +310,10 @@ type entry struct {
 	// 单 until 字段做不到的）。仅 6004 触发时记录；空 map = 无模型级限流（不豁免）。
 	// 运行态语义（不持久化）：重启清零，退化为仅账号级 until 冷却的现状。
 	modelCooldowns map[string]modelCooldown
+	// modelHits 模型级退避命中记忆（运行态）：modelCooldowns 在到期后首次 pick 即被删除，
+	// 若不单独保留短期命中记忆，14003/11102/429 的指数退避永远停在首档（hits=1）。
+	// 按错误类别隔离（14003 繁忙不会污染 429 的长阶梯），成功请求或 15 分钟静默后清零。
+	modelHits map[string]modelHit
 
 	// modelOff 手动关闭的「(账号, 模型)」组合（稀疏：只为"被关掉"的组合建条目）。
 	// 与 modelCooldowns 的区别：那是**上游触发、临时**（过期自动删）；这是**运维触发、
@@ -519,16 +523,53 @@ func (e *entry) pruneExpiredModelCosts(now time.Time) {
 	}
 }
 
+const (
+	hitSoftRate   uint8 = 1
+	hitModelBusy  uint8 = 2
+	hitModelBlock uint8 = 3
+
+	modelHitTTL = 15 * time.Minute
+)
+
+type modelHit struct {
+	hits   int
+	kind   uint8
+	seenAt time.Time
+}
+
+// nextModelHit 递增并返回 (账号, 模型) 在同种错误类别下的连续退避次数。调用方须持写锁。
+func (e *entry) nextModelHit(model string, kind uint8, now time.Time) int {
+	h := e.modelHits[model]
+	hits := 1
+	if h.kind == kind && !h.seenAt.IsZero() && now.Sub(h.seenAt) <= modelHitTTL {
+		hits = h.hits + 1
+	} else if mc, ok := e.modelCooldowns[model]; ok && mc.Hits > 0 && h.kind == 0 {
+		// 兼容测试直接预置 modelCooldowns[model].Hits 的场景。
+		hits = mc.Hits + 1
+	}
+	if e.modelHits == nil {
+		e.modelHits = make(map[string]modelHit)
+	}
+	e.modelHits[model] = modelHit{hits: hits, kind: kind, seenAt: now}
+	return hits
+}
+
 // pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。
 // pick 写锁路径与 revive 调用，防止 map 无限膨胀；status 只读遍历天然跳过过期项，
 // 无需清理。调用方必须已持有 p.mu 写锁。
 func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
-	if len(e.modelCooldowns) == 0 {
-		return
+	if len(e.modelCooldowns) > 0 {
+		for m, mc := range e.modelCooldowns {
+			if mc.Until.IsZero() || !now.Before(mc.Until) {
+				delete(e.modelCooldowns, m)
+			}
+		}
 	}
-	for m, mc := range e.modelCooldowns {
-		if mc.Until.IsZero() || !now.Before(mc.Until) {
-			delete(e.modelCooldowns, m)
+	if len(e.modelHits) > 0 {
+		for m, mh := range e.modelHits {
+			if mh.seenAt.IsZero() || now.Sub(mh.seenAt) > modelHitTTL {
+				delete(e.modelHits, m)
+			}
 		}
 	}
 }

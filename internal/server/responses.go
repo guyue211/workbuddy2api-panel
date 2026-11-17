@@ -615,6 +615,7 @@ var reasoningKnownTypes = map[string]bool{
 	"function_call": true, "function_call_output": true,
 	"custom_tool_call": true, "custom_tool_call_output": true,
 	"agent_message": true,
+	"compaction": true, "compaction_summary": true, "context_compaction": true,
 }
 
 // reasoningGroupTarget 从 start+1 起找 reasoning 项之后第一个「实质项」：无 type 的

@@ -265,6 +265,20 @@ func (p *Pool) SetReserveCreditsByRealm(m map[string]int64) {
 	p.reserveByRealm = m
 }
 
+// ReserveCreditsStatus 返回生效的全局保留积分阈值与按域覆盖表副本（供 /status 透出）。
+func (p *Pool) ReserveCreditsStatus() (int64, map[string]int64) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	var byRealm map[string]int64
+	if len(p.reserveByRealm) > 0 {
+		byRealm = make(map[string]int64, len(p.reserveByRealm))
+		for k, v := range p.reserveByRealm {
+			byRealm[k] = v
+		}
+	}
+	return p.reserveCredits, byRealm
+}
+
 // reserveThreshold 该域的保留积分阈值：按域覆盖优先，未写回落全局值。
 // 调用方须持锁；realm 为空当 "cn"（与 Auth.Realm 的归一化口径一致）。
 func (p *Pool) reserveThreshold(realm string) int64 {

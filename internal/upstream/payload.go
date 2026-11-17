@@ -266,13 +266,19 @@ func trimHistory(obj map[string]any, keep int) {
 // 透传由上游报 11101 参数错）。两域同口径：CN /v2 与 global /console 是同一套
 // API，翻译不分 realm。
 func translateMaxCompletionTokens(obj map[string]any) {
-	alias, has := obj["max_completion_tokens"]
+	aliasComp, hasComp := obj["max_completion_tokens"]
+	aliasOut, hasOut := obj["max_output_tokens"]
 	delete(obj, "max_completion_tokens") // 无论翻译与否，别名一律删（减少 body 体积与排障噪音）
-	if !has {
+	delete(obj, "max_output_tokens")     // Responses 协议同义字段一并归一，避免被 injectCatalogMaxTokens 覆盖
+	if !hasComp && !hasOut {
 		return
 	}
 	if _, explicit := obj["max_tokens"]; explicit {
 		return // 显式 max_tokens 优先：别名只删不译
+	}
+	alias := aliasComp
+	if !hasComp {
+		alias = aliasOut
 	}
 	// json.Unmarshal 数字 → float64（整数去整后回写，避免 1.28e5 科学计数法/小数
 	// 尾巴进上游 body）；其他数值类型防御性兼容（int 家族——手构造 map 的调用方）。
@@ -331,15 +337,22 @@ func clampGPTMinMaxTokens(obj map[string]any) {
 // 客户端写大文件会在 32000 处被无声截断（长流任务被切）。显式限额（含别名翻译
 // 产物）优先，不覆盖；模型未知/目录无值不补（不编造）。
 func injectCatalogMaxTokens(obj map[string]any, maxOut map[string]int64) {
-	if len(maxOut) == 0 {
-		return
-	}
 	if _, has := obj["max_tokens"]; has {
 		return
 	}
 	model, _ := obj["model"].(string)
-	if v, ok := maxOut[model]; ok && v > 0 {
-		obj["max_tokens"] = v
+	if len(maxOut) > 0 {
+		if v, ok := maxOut[model]; ok && v > 0 {
+			obj["max_tokens"] = v
+			return
+		}
+	}
+	// 兜底：冷启动尚未拉过 /v1/models 或隐藏付费变体（如 -sg）未进公开目录时，
+	// model.json 的 source=manual 手编条目依然生效。
+	if model != "" {
+		if e, ok := manualCap(model); ok && e.MaxOutputTokens > 0 {
+			obj["max_tokens"] = e.MaxOutputTokens
+		}
 	}
 }
 

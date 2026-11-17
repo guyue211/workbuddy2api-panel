@@ -429,3 +429,19 @@ func TestDeriveCacheKeyGivesUserIDClientsPerConversationSlots(t *testing.T) {
 		t.Fatal("不同 user_id 的同一段内容必须分槽（#234 跨用户碰撞）")
 	}
 }
+
+func TestLookupForModelDoesNotPreAllocateOnMiss(t *testing.T) {
+	st := newCountingStore()
+	r := New(Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"u1", "u2"} },
+	})
+	if uid, ok := r.LookupForModel("new-conv", "glm-5.3"); ok || uid != "" {
+		t.Fatalf("new session miss should not pre-allocate: uid=%q ok=%v", uid, ok)
+	}
+	r.Bind("new-conv", "u2")
+	if uid, ok := r.LookupForModel("new-conv", "glm-5.3"); !ok || uid != "u2" {
+		t.Fatalf("existing binding should hit u2: uid=%q ok=%v", uid, ok)
+	}
+}
