@@ -31,8 +31,10 @@ package server
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"log"
 	"strings"
+	"unicode"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
@@ -119,11 +121,18 @@ var toolOnlyClosingMarkers = []string{
 // toolOnlyLastSentence 取最后一个句末标点之后的那一句（去掉尾部标点）。
 // 只按句末标点切（不按逗号）："检查完了，我继续修下一个" 整句都算最后一句，
 // 切成半句反而会把意图词切走。
+//
+// 半角 . ! ? 只有后面是空白或文本结尾才算句末：文件名（UnityManual.html、check.go）、
+// 版本号（v1.2）、URL 里的点不是句子边界，按它切会把句子从中间截断（"我将开始修改
+// internal/verify/check.go" 会被切成 "go"）。全角 。！？ 任何位置都算句末。
 func toolOnlyLastSentence(s string) string {
 	rs := []rune(strings.TrimRight(s, " \t\r\n"))
 	start, end := 0, len(rs)
 	for i := len(rs) - 1; i >= 0; i-- {
 		if !strings.ContainsRune("。！？!?.", rs[i]) {
+			continue
+		}
+		if rs[i] < 0x80 && i+1 < len(rs) && !unicode.IsSpace(rs[i+1]) {
 			continue
 		}
 		if i == end-1 {
@@ -208,26 +217,22 @@ func (r *continueReader) tryToolOnlyRescue() bool {
 	r.toolOnlyTried = true
 	// 首段的终态帧先存起来：续写段如果只给正文，要原样回放这一份。
 	r.origFinish, r.origTail = r.finish, r.tail
-	rc, status, _, terr := r.up.ChatStreamContext(r.ctx, r.acct, body, r.clientIP, r.meta, nil)
-	if terr != nil || status >= 400 || rc == nil {
-		if rc != nil {
-			rc.Close()
-		}
+	// 异步换段：等待期内客户端只会收到 keepalive（见 openSegmentAsync）。
+	return r.openSegmentAsync(switchToolOnly, body, func(rc io.ReadCloser) {
+		r.seg++
+		r.cur, r.br = rc, bufio.NewReaderSize(rc, 64*1024)
+		r.finish, r.tail = "", nil
+		r.toolOnly = true
+		r.toolOnlyFailed = false
+		r.toolCallBuf, r.toolCallNames, r.toolCallArgs = nil, nil, nil
+		r.segCompletion, r.segThink = 0, 0
+		log.Printf("[toolonly] acct=%s model=%s seg=%d 正文只有 %dB 就收尾（末条是工具结果）→ 试续一次，只采纳工具调用",
+			logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg, r.text.Len())
+	}, func(status int, terr error) {
 		r.origFinish, r.origTail = "", nil
 		log.Printf("WARN: [toolonly] acct=%s seg=%d 续写请求失败（status=%d err=%v）→ 按原样收尾",
 			logfmt.Label(r.acct.UID, r.acct.Nickname), r.seg+1, status, terr)
-		return false
-	}
-	r.seg++
-	r.cur, r.br = rc, bufio.NewReaderSize(rc, 64*1024)
-	r.finish, r.tail = "", nil
-	r.toolOnly = true
-	r.toolOnlyFailed = false
-	r.toolCallBuf, r.toolCallNames, r.toolCallArgs = nil, nil, nil
-	r.segCompletion, r.segThink = 0, 0
-	log.Printf("[toolonly] acct=%s model=%s seg=%d 正文只有 %dB 就收尾（末条是工具结果）→ 试续一次，只采纳工具调用",
-		logfmt.Label(r.acct.UID, r.acct.Nickname), bareModelOf(r.body), r.seg, r.text.Len())
-	return true
+	})
 }
 
 // toolOnlyFrame 「只采纳工具调用」段的全部 data 帧都走这里（frame() 入口改道）。

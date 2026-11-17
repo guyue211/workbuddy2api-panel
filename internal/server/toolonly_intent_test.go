@@ -2,7 +2,9 @@
 //
 // 背景：toolOnlyFinalAnswerBytes=120 这条闸门把「正文 ≥120B 且以句末标点收尾」当成
 // 最终答复，于是
-//   "我继续检查其他被错误替换的内容，例如 manual 关键字、UnityManual.html 链接。"
+//
+//	"我继续检查其他被错误替换的内容，例如 manual 关键字、UnityManual.html 链接。"
+//
 // （157B）被当成总结放过，客户端回合就此结束——用户看到「说到一半没了」。
 //
 // 修法：只看**最后一句**，有收尾词（总结/已完成/全部完成/完毕…）→ 仍算说完；
@@ -59,6 +61,9 @@ func TestToolOnlyLastSentence(t *testing.T) {
 		{"结尾多个标点……ok。", "结尾多个标点……ok"},
 		{"", ""},
 		{"。。。", ""},
+		// 半角点后面不是空白（文件名、版本号）不算句末。
+		{"写完了。我将开始修改 internal/verify/check.go", "我将开始修改 internal/verify/check.go"},
+		{"已确认。升到 v1.2 再看", "升到 v1.2 再看"},
 	}
 	for _, c := range cases {
 		if got := toolOnlyLastSentence(c.in); got != c.want {
