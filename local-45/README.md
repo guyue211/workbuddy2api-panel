@@ -444,3 +444,21 @@ finish_reason=stop。回滚备份 `/opt/backups/wb-local-45-MEkbet2I`。
 经 8788 实测 HTTP 200、正文 `OK`、finish_reason=stop（实际由国际模型服务）。
 启动后 ERR=0，有一条国际模型企业目录 500 告警，已回落 v3/config，实测对话正常。
 回滚备份 `/opt/backups/wb-local-45-6eHoSFLQ`。
+
+## 2026-11-18 同步上游、全链路审计优化与双组件部署 2026.11.18.300
+
+合入 `09189a5..b85d4f2` 的 52 条提交（含 tag `v2026.11.16.2326`、国内版 5.11.3 `X-Client-*` 三头、tools schema 深度规整、`/v1/responses` 思考历史回放、异步换段保活与面板实时任务卡），无冲突。
+
+全仓深度审计与调度/功能增强（提交 `b461b94`）：
+
+- **鉴权与连接层修复**：`balance_401.go` 改用统一的 `VerifySessionByRefresh` 并移除 `SessionDeadButUsable` 误拦截（修复已注销账号因本地 `ExpiresAt` 未到期而永不禁用、持续空刷上游的问题，上线首轮即自动禁用失效号 `bc4d96c5`）；`headOrderConn` 在响应边界复位 `respTracker`（修复 HTTP/1.1 Keep-Alive 复用下第 2+ 轮状态残留）；`proxypool` 深拷贝 `Realms` 消除并发读写竞态，并支持已移出账号的残留代理固定绑定解绑。
+- **预算、续写与协议管线修复**：`storeModelMaxOut`、`injectCatalogMaxTokens` 与 `outputFloor` 全面覆盖隐藏付费变体（`-sg`）及冷启动下的 `source=manual` 条目；`translateMaxCompletionTokens` 一并归一 `/v1/responses` 的 `max_output_tokens`；`forcedModelAliases` 与 `models.allowed` 白名单、`thinking.model_defaults`、`model_fallback` 及 `/v2/chat/busy` 完整对齐；`/v1/messages` 流式透传 SSE 保活注释帧；`continueCapped` 仅在截断/断流分支置位；`NoteSuccess`/`Session.Bind` 延后至越过 `HeadVetoError` 与 `Aggregate` 校验之后，请求级参数错误保留会话粘性。
+- **号池调度优化**：新增 `Session.LookupForModel`，新会话首轮交由 `Pool.PickExcludingForRealm` 执行完整调度管线（严格遵守 `account_priority` / `account_share` / `costTier` / 保底策略），消除新会话哈希绕过优先级的问题；补齐模型级退避命中记忆 `modelHits`（跨惰性清理保留阶梯）、等权重洗牌保序、兜底选号规则门禁，并在 `/status` 与 `no selectable account` 日志中显式暴露 `reserve_credits` 与分项拦截计数。
+- **`wb-router` 升级与观测增强**：后台每 3s 轮询网关 `/healthz` 感知 `realm_servable`（首选域整域不可服务时零探测直切备选域，彻底消除此前因国际域触及保留积分而每 2 分钟产生的无效失败流水）；顶层 `"model"` 改为零全量反序列化字节拼接，默认上限提至 64 MiB 且超限显式回 413；流式预检支持跨 16 KiB 超长单行 `response.created`；路由覆盖扩展至 `count_tokens`/生图/视频及 `GET /v1/models/{id}`，`/v1/models` 合并优先采用当前活跃首选域元数据；新增 `GET /router/status` 观测端点与 `X-Wb-Router-Domain` 响应头；`deploy.sh` 支持 `-y` 非交互部署并自动清理 `.deploy.*` 暂存目录与超量历史备份。
+
+`go build ./...`、`go vet ./...`、`node --check internal/panel/app.js`、`go test -count=1 ./...` 与各核心包 `-race` 测试全绿。同时部署网关与路由（`bash local-45/deploy.sh -y all`），版本 `2026.11.18.300`：
+
+- `wb2api` SHA256：`cd80dc8d79e53b7936f7ef8bb89cc18d3d46379ffa2c2156612f88db0623b35c`
+- `wb-router` SHA256：`f0de26d0a4fd5aabfdd2a69afc3959e5ed7952f920ab866459e063edab3da64b`
+- `config.json` 部署前后 SHA256 一致，历史遗留 `.deploy.*` 目录已全部清零，回滚备份 `/opt/backups/wb-local-45-Rlmvxcj6`。
+- 线上验证：两端 `/healthz` 为 `healthy=11/12`（失效号 `bc4d96c5` 已自动转 `disabled`）；`/router/status` 显示 `effective_prefer="cn"`；经 8788 实测单模型查询、非流式 `/v1/chat/completions` 与流式 `/v1/responses` 均首跳直达 `cn`、HTTP 200、`fallbacks_total=0`。
